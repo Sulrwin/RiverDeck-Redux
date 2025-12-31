@@ -7,6 +7,42 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DownloadSpec {
+    Url(String),
+    Platforms(DownloadPlatforms),
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DownloadPlatforms {
+    #[serde(default)]
+    linux: Option<String>,
+    #[serde(default)]
+    windows: Option<String>,
+    #[serde(default)]
+    macos: Option<String>,
+}
+
+fn pick_platform_download(spec: &DownloadSpec) -> Option<String> {
+    match spec {
+        DownloadSpec::Url(u) => {
+            let u = u.trim();
+            if u.is_empty() { None } else { Some(u.to_string()) }
+        }
+        DownloadSpec::Platforms(p) => {
+            let pick = if cfg!(windows) {
+                p.windows.as_deref()
+            } else if cfg!(target_os = "macos") {
+                p.macos.as_deref()
+            } else {
+                p.linux.as_deref()
+            };
+            pick.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MarketplacePlugin {
     pub id: String,
     pub name: String,
@@ -18,14 +54,25 @@ pub struct MarketplacePlugin {
     pub author: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
+    /// Optional source repository URL (often GitHub).
+    #[serde(default)]
+    pub repository: Option<String>,
     /// Optional URL pointing to an icon for display in UIs.
     #[serde(default)]
+    #[serde(alias = "iconUrl")]
     pub icon_url: Option<String>,
     /// Optional URL for downloading/installing the plugin artifact.
     ///
     /// Note: the install flow is intentionally out of scope for MVP.
     #[serde(default)]
+    #[serde(alias = "downloadUrl")]
     pub download_url: Option<String>,
+    /// Optional alternative download shape (string or platform-specific map).
+    #[serde(default)]
+    pub downloads: Option<DownloadSpec>,
+    /// Optional screenshot/image URLs for marketplace details.
+    #[serde(default, alias = "screenshots", alias = "images")]
+    pub images: Vec<String>,
 }
 
 /// The Rivul/OpenAction catalogue shape is a map keyed by plugin ID:
@@ -42,9 +89,17 @@ struct CatalogueEntry {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "iconUrl")]
     pub icon_url: Option<String>,
     #[serde(default)]
+    #[serde(alias = "downloadUrl")]
     pub download_url: Option<String>,
+    #[serde(default)]
+    pub downloads: Option<DownloadSpec>,
+    #[serde(default, alias = "screenshots", alias = "images")]
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +124,7 @@ pub async fn fetch_plugins(index_url: &str) -> anyhow::Result<Vec<MarketplacePlu
         anyhow::anyhow!("failed to parse marketplace JSON: {e}. body preview: {preview}")
     })?;
 
-    let mut plugins = match parsed {
+    let mut plugins: Vec<MarketplacePlugin> = match parsed {
         MarketplaceResponse::List(list) => list,
         MarketplaceResponse::Wrapped { plugins } => plugins,
         MarketplaceResponse::Catalogue(map) => map
@@ -81,11 +136,23 @@ pub async fn fetch_plugins(index_url: &str) -> anyhow::Result<Vec<MarketplacePlu
                 description: e.description.unwrap_or_default(),
                 author: e.author,
                 homepage: e.homepage,
+                repository: e.repository,
                 icon_url: e.icon_url,
-                download_url: e.download_url,
+                download_url: e
+                    .download_url
+                    .or_else(|| e.downloads.as_ref().and_then(pick_platform_download)),
+                downloads: e.downloads,
+                images: e.images,
             })
             .collect(),
     };
+
+    // Normalize: if the marketplace provides an alternate download shape, prefer it.
+    for p in &mut plugins {
+        if p.download_url.as_deref().map(|s| s.trim()).unwrap_or("").is_empty() {
+            p.download_url = p.downloads.as_ref().and_then(pick_platform_download);
+        }
+    }
 
     plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(plugins)

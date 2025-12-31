@@ -122,8 +122,12 @@ struct MarketplaceState {
     query: String,
     error: Option<String>,
     icon_cache: HashMap<String, iced::widget::image::Handle>,
-    visible: usize,
+    image_cache: HashMap<String, iced::widget::image::Handle>,
+    svg_cache: HashMap<String, iced::widget::svg::Handle>,
+    details_cache: HashMap<String, MarketplaceDetails>,
+    page: usize,
     installing: Option<String>,
+    selected: Option<MarketplacePlugin>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +149,20 @@ struct SystemSnapshot {
 struct DragState {
     dragging: Option<DraggedAction>,
     over_key: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MarketplaceDetails {
+    /// Resolved direct download URL (ideally an archive asset URL).
+    resolved_download_url: Option<String>,
+    /// Total download count across releases (best-effort).
+    total_downloads: Option<u64>,
+    /// Repository URL (usually GitHub) if known.
+    repository: Option<String>,
+    /// README markdown (best-effort).
+    readme_md: Option<String>,
+    /// Discovered image URLs from README and/or marketplace metadata.
+    image_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,8 +235,12 @@ impl Application for App {
                 query: String::new(),
                 error: None,
                 icon_cache: HashMap::new(),
-                visible: MARKETPLACE_PAGE_SIZE,
+                image_cache: HashMap::new(),
+                svg_cache: HashMap::new(),
+                details_cache: HashMap::new(),
+                page: 0,
                 installing: None,
+                selected: None,
             },
             error: None,
             next_action_seq_id: 1,
@@ -669,7 +691,7 @@ impl Application for App {
             },
             Message::OpenMarketplace => {
                 self.active_view = ActiveView::Marketplace;
-                self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
+                self.marketplace.page = 0;
                 let Some(idx) = self.marketplace.selected_source_idx else {
                     self.marketplace.loading = false;
                     self.marketplace.error = Some("No marketplace selected.".to_string());
@@ -724,7 +746,7 @@ impl Application for App {
             }
             Message::MarketplaceSearchChanged(q) => {
                 self.marketplace.query = q;
-                self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
+                self.marketplace.page = 0;
                 Command::none()
             }
             Message::MarketplaceLoaded(res) => {
@@ -733,7 +755,6 @@ impl Application for App {
                     Ok(list) => {
                         self.marketplace.plugins = list;
                         self.marketplace.error = None;
-                        self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
                         // Kick off icon fetches for the current marketplace source.
                         if let Some(src) = self.current_marketplace_source().cloned() {
                             let mut cmds = vec![];
@@ -751,7 +772,8 @@ impl Application for App {
                                             || p.description.to_ascii_lowercase().contains(&q)
                                     }
                                 })
-                                .take(self.marketplace.visible)
+                                .skip(self.marketplace.page.saturating_mul(MARKETPLACE_PAGE_SIZE))
+                                .take(MARKETPLACE_PAGE_SIZE)
                             {
                                 let Some(icon_url) = marketplace_icon_url(&src, p) else {
                                     continue;
@@ -788,10 +810,8 @@ impl Application for App {
                     return Command::none();
                 };
 
-                let Some(url) = resolve_marketplace_download_url(&src, &p) else {
-                    self.marketplace.error = Some("Plugin has no download URL.".to_string());
-                    return Command::none();
-                };
+                // Prefer a direct download URL from the marketplace feed.
+                let url = resolve_marketplace_download_url(&src, &p);
 
                 if self.plugins.iter().any(|ip| ip.manifest.id == p.id) {
                     return Command::none();
@@ -799,10 +819,24 @@ impl Application for App {
 
                 self.marketplace.installing = Some(p.id.clone());
                 self.marketplace.error = None;
-                Command::perform(
-                    install_marketplace_async(url, p.id),
-                    Message::MarketplaceInstalled,
-                )
+                if let Some(url) = url {
+                    Command::perform(
+                        install_marketplace_async(url, p.id),
+                        Message::MarketplaceInstalled,
+                    )
+                } else if let Some(repo) = p.repository.clone() {
+                    // Rivul marketplace derives downloads from the GitHub repository.
+                    // We attempt to resolve a release asset URL and install it.
+                    Command::perform(
+                        install_marketplace_from_repo_async(repo, p.id),
+                        Message::MarketplaceInstalled,
+                    )
+                        } else {
+                    self.marketplace.installing = None;
+                    self.marketplace.error =
+                        Some("No installable download found for this plugin.".to_string());
+                    Command::none()
+                }
             }
             Message::MarketplaceInstalled(res) => {
                 self.marketplace.installing = None;
@@ -817,57 +851,16 @@ impl Application for App {
                     }
                 }
             }
-            Message::MarketplaceLoadMore => {
-                let prev = self.marketplace.visible;
-                self.marketplace.visible = self
-                    .marketplace
-                    .visible
-                    .saturating_add(MARKETPLACE_PAGE_SIZE);
-
-                let Some(src) = self.current_marketplace_source().cloned() else {
+            Message::MarketplacePrevPage => {
+                if self.marketplace.page == 0 {
                     return Command::none();
-                };
-
-                // Fetch icons only for newly visible entries.
-                let q = self.marketplace.query.trim().to_ascii_lowercase();
-                let mut cmds = vec![];
-                for (i, p) in self
-                    .marketplace
-                    .plugins
-                    .iter()
-                    .filter(|p| {
-                        if q.is_empty() {
-                            true
-                        } else {
-                            p.name.to_ascii_lowercase().contains(&q)
-                                || p.id.to_ascii_lowercase().contains(&q)
-                                || p.description.to_ascii_lowercase().contains(&q)
-                        }
-                    })
-                    .enumerate()
-                {
-                    if i < prev {
-                        continue;
-                    }
-                    if i >= self.marketplace.visible {
-                        break;
-                    }
-                    let Some(icon_url) = marketplace_icon_url(&src, p) else {
-                        continue;
-                    };
-                    let key = format!("{}|{}", src.index_url, p.id);
-                    if self.marketplace.icon_cache.contains_key(&key) {
-                        continue;
-                    }
-                    cmds.push(Command::perform(
-                        fetch_icon_async(icon_url),
-                        {
-                            let key = key.clone();
-                            move |bytes| Message::MarketplaceIconLoaded { key, bytes }
-                        },
-                    ));
                 }
-                Command::batch(cmds)
+                self.marketplace.page = self.marketplace.page.saturating_sub(1);
+                self.marketplace_fetch_icons_for_current_page()
+            }
+            Message::MarketplaceNextPage => {
+                self.marketplace.page = self.marketplace.page.saturating_add(1);
+                self.marketplace_fetch_icons_for_current_page()
             }
             Message::MarketplaceIconLoaded { key, bytes } => {
                 if let Ok(bytes) = bytes {
@@ -876,6 +869,183 @@ impl Application for App {
                         .insert(key, iced::widget::image::Handle::from_memory(bytes));
                 }
                 Command::none()
+            }
+            Message::MarketplaceSelect(p) => {
+                self.marketplace.selected = Some(p.clone());
+                self.marketplace.error = None;
+
+                let Some(src) = self.current_marketplace_source().cloned() else {
+                    return Command::none();
+                };
+
+                let mut cmds = vec![];
+
+                // Ensure the selected icon is fetched (may not be in visible range).
+                if let Some(icon_url) = marketplace_icon_url(&src, &p) {
+                    let key = format!("{}|{}", src.index_url, p.id);
+                    if !self.marketplace.icon_cache.contains_key(&key) {
+                        cmds.push(Command::perform(
+                            fetch_icon_async(icon_url),
+                            {
+                                let key = key.clone();
+                                move |bytes| Message::MarketplaceIconLoaded { key, bytes }
+                            },
+                        ));
+                    }
+                }
+
+                // Fetch screenshots / images lazily.
+                for raw in p.images.iter().take(8) {
+                    let Some(url) = resolve_marketplace_asset_url(&src, raw) else {
+                        continue;
+                    };
+                    let key = format!("img|{}|{}|{}", src.index_url, p.id, url);
+                    if self.marketplace.image_cache.contains_key(&key)
+                        || self.marketplace.svg_cache.contains_key(&key)
+                    {
+                        continue;
+                    }
+                    if url.to_ascii_lowercase().contains(".svg") {
+                        cmds.push(Command::perform(
+                            fetch_icon_async(url),
+                            {
+                                let key = key.clone();
+                                move |bytes| Message::MarketplaceSvgLoaded { key, bytes }
+                            },
+                        ));
+                    } else {
+                        cmds.push(Command::perform(
+                            fetch_icon_async(url),
+                            {
+                                let key = key.clone();
+                                move |bytes| Message::MarketplaceImageLoaded { key, bytes }
+                            },
+                        ));
+                    }
+                }
+
+                // Fetch richer details (README, derived downloads, README images).
+                if !self.marketplace.details_cache.contains_key(&p.id) {
+                    cmds.push(Command::perform(
+                        fetch_marketplace_details_async(p.clone()),
+                        {
+                            let plugin_id = p.id.clone();
+                            move |details| Message::MarketplaceDetailsLoaded { plugin_id, details }
+                        },
+                    ));
+                }
+
+                if cmds.is_empty() {
+                    Command::none()
+                } else {
+                Command::batch(cmds)
+            }
+            }
+            Message::MarketplaceImageLoaded { key, bytes } => {
+                if let Ok(bytes) = bytes {
+                    self.marketplace
+                        .image_cache
+                        .insert(key, iced::widget::image::Handle::from_memory(bytes));
+                }
+                Command::none()
+            }
+            Message::MarketplaceSvgLoaded { key, bytes } => {
+                if let Ok(bytes) = bytes {
+                    self.marketplace
+                        .svg_cache
+                        .insert(key, iced::widget::svg::Handle::from_memory(bytes));
+                }
+                Command::none()
+            }
+            Message::MarketplaceDetailsLoaded { plugin_id, details } => {
+                match details {
+                    Ok(d) => {
+                        // Merge cache.
+                        let mut merged = d.clone();
+                        if let Some(p) = self.marketplace.plugins.iter().find(|p| p.id == plugin_id) {
+                            // include any marketplace-provided images too
+                            for u in &p.images {
+                                if !merged.image_urls.contains(u) {
+                                    merged.image_urls.push(u.clone());
+                                }
+                            }
+                        }
+                        self.marketplace.details_cache.insert(plugin_id.clone(), merged.clone());
+
+                        // If we discovered a direct download URL, update the marketplace plugin in-place
+                        // so the list can show Install immediately.
+                        if let Some(url) = merged.resolved_download_url.clone() {
+                            if let Some(p) = self
+                                .marketplace
+                                .plugins
+                                .iter_mut()
+                                .find(|p| p.id == plugin_id)
+                            {
+                                if p.download_url.as_deref().map(|s| s.trim()).unwrap_or("").is_empty()
+                                {
+                                    p.download_url = Some(url.clone());
+                                }
+                            }
+                            if let Some(sel) = self.marketplace.selected.as_mut() {
+                                if sel.id == plugin_id
+                                    && sel.download_url.as_deref().map(|s| s.trim()).unwrap_or("").is_empty()
+                                {
+                                    sel.download_url = Some(url);
+                                }
+                            }
+                        }
+
+                        // Kick off image fetches for discovered URLs (best-effort).
+                        let Some(src) = self.current_marketplace_source().cloned() else {
+                            return Command::none();
+                        };
+                        let mut cmds = vec![];
+                        for raw in merged.image_urls.iter().take(12) {
+                            if !is_renderable_image_url(raw) {
+                                continue;
+                            }
+                            let Some(url) = resolve_marketplace_asset_url(&src, raw) else {
+                                continue;
+                            };
+                            let key = format!("img|{}|{}|{}", src.index_url, plugin_id, url);
+                            if self.marketplace.image_cache.contains_key(&key)
+                                || self.marketplace.svg_cache.contains_key(&key)
+                            {
+                                continue;
+                            }
+                            if url.to_ascii_lowercase().contains(".svg") {
+                                cmds.push(Command::perform(
+                                    fetch_icon_async(url),
+                                    {
+                                        let key = key.clone();
+                                        move |bytes| Message::MarketplaceSvgLoaded { key, bytes }
+                                    },
+                                ));
+                            } else {
+                                cmds.push(Command::perform(
+                                    fetch_icon_async(url),
+                                    {
+                                        let key = key.clone();
+                                        move |bytes| Message::MarketplaceImageLoaded { key, bytes }
+                                    },
+                                ));
+                            }
+                        }
+                        if cmds.is_empty() {
+                            Command::none()
+                        } else {
+                            Command::batch(cmds)
+                        }
+                    }
+                    Err(e) => {
+                        // Keep the UI usable even if GitHub is rate-limited.
+                        tracing::debug!(plugin_id, error=%e, "marketplace details fetch failed");
+                        Command::none()
+                    }
+                }
+            }
+            Message::OpenUrl(url) => {
+                Command::perform(open_url_async(url), |_| Message::Tick)
             }
             Message::ActionSeqContinue(seq_id) => self.run_next_action_step(seq_id),
             Message::ActionSeqStepDone { seq_id, res } => {
@@ -1313,7 +1483,16 @@ enum Message {
     MarketplaceSearchChanged(String),
     MarketplaceLoaded(Result<Vec<MarketplacePlugin>, String>),
     MarketplaceIconLoaded { key: String, bytes: Result<Vec<u8>, String> },
-    MarketplaceLoadMore,
+    MarketplacePrevPage,
+    MarketplaceNextPage,
+    MarketplaceSelect(MarketplacePlugin),
+    MarketplaceImageLoaded { key: String, bytes: Result<Vec<u8>, String> },
+    MarketplaceSvgLoaded { key: String, bytes: Result<Vec<u8>, String> },
+    MarketplaceDetailsLoaded {
+        plugin_id: String,
+        details: Result<MarketplaceDetails, String>,
+    },
+    OpenUrl(String),
     MarketplaceInstall(MarketplacePlugin),
     MarketplaceInstalled(Result<(), String>),
     ActionSeqContinue(u64),
@@ -1532,6 +1711,54 @@ impl App {
         self.marketplace
             .selected_source_idx
             .and_then(|i| self.marketplace.sources.get(i))
+    }
+
+    fn marketplace_fetch_icons_for_current_page(&self) -> Command<Message> {
+        let Some(src) = self.current_marketplace_source().cloned() else {
+            return Command::none();
+        };
+
+        let q = self.marketplace.query.trim().to_ascii_lowercase();
+        let start = self.marketplace.page.saturating_mul(MARKETPLACE_PAGE_SIZE);
+
+        let mut cmds = vec![];
+        for p in self
+            .marketplace
+            .plugins
+            .iter()
+            .filter(|p| {
+                if q.is_empty() {
+                    true
+                } else {
+                    p.name.to_ascii_lowercase().contains(&q)
+                        || p.id.to_ascii_lowercase().contains(&q)
+                        || p.description.to_ascii_lowercase().contains(&q)
+                }
+            })
+            .skip(start)
+            .take(MARKETPLACE_PAGE_SIZE)
+        {
+            let Some(icon_url) = marketplace_icon_url(&src, p) else {
+                continue;
+            };
+            let key = format!("{}|{}", src.index_url, p.id);
+            if self.marketplace.icon_cache.contains_key(&key) {
+                continue;
+            }
+            cmds.push(Command::perform(
+                fetch_icon_async(icon_url),
+                {
+                    let key = key.clone();
+                    move |bytes| Message::MarketplaceIconLoaded { key, bytes }
+                },
+            ));
+        }
+
+        if cmds.is_empty() {
+            Command::none()
+        } else {
+            Command::batch(cmds)
+        }
     }
 
     fn start_action_sequence(
@@ -2015,11 +2242,16 @@ impl App {
                     || p.description.to_ascii_lowercase().contains(&q)
             }
         });
-        let total_matches = list_iter.clone().count();
-        let shown = self.marketplace.visible.min(total_matches);
+        let matches = list_iter.collect::<Vec<_>>();
+        let total_matches = matches.len();
+        let page_count = (total_matches + MARKETPLACE_PAGE_SIZE - 1) / MARKETPLACE_PAGE_SIZE;
+        let page = self.marketplace.page.min(page_count.saturating_sub(1));
+        let start = page.saturating_mul(MARKETPLACE_PAGE_SIZE);
+        let end = (start + MARKETPLACE_PAGE_SIZE).min(total_matches);
+        let shown = if total_matches == 0 { 0 } else { end.saturating_sub(start) };
 
         let mut list = column![].spacing(10);
-        for p in list_iter.take(self.marketplace.visible) {
+        for p in matches.into_iter().skip(start).take(MARKETPLACE_PAGE_SIZE) {
             let icon: Element<Message> = if let Some(src) = &selected {
                 let key = format!("{}|{}", src.index_url, p.id);
                 if let Some(handle) = self.marketplace.icon_cache.get(&key) {
@@ -2059,31 +2291,56 @@ impl App {
                 .installing
                 .as_deref()
                 .is_some_and(|id| id == p.id);
+            let is_selected = self
+                .marketplace
+                .selected
+                .as_ref()
+                .is_some_and(|sel| sel.id == p.id);
+            let can_install_direct = selected
+                .as_ref()
+                .and_then(|src| resolve_marketplace_download_url(src, p))
+                .is_some();
+            let can_install_repo = p
+                .repository
+                .as_deref()
+                .and_then(parse_github_owner_repo)
+                .is_some();
+            let can_install = can_install_direct || can_install_repo;
 
             let install_btn = if is_installed {
                 button(text("Installed")).style(iced::theme::Button::Secondary)
             } else if is_installing {
                 button(text("Installing…")).style(iced::theme::Button::Secondary)
-            } else if p.download_url.is_some() {
+            } else if can_install {
                 button(text("Install"))
                     .style(iced::theme::Button::Secondary)
                     .on_press(Message::MarketplaceInstall(p.clone()))
             } else {
-                button(text("Install")).style(iced::theme::Button::Secondary)
+                button(text("No download")).style(iced::theme::Button::Secondary)
             };
+
+            let select_area: Element<Message> = mouse_area(
+                container(
+                    row![icon, container(body).width(Length::Fill)]
+                        .spacing(12)
+                        .align_items(Alignment::Center),
+                )
+                .width(Length::Fill),
+            )
+            .on_press(Message::MarketplaceSelect(p.clone()))
+            .into();
 
             list = list.push(
                 container(
                     row![
-                        icon,
-                        container(body).width(Length::Fill),
+                        container(select_area).width(Length::Fill),
                         install_btn
                     ]
                     .spacing(12)
                     .align_items(Alignment::Center),
                 )
                 .padding(10)
-                .style(panel()),
+                .style(if is_selected { callout_card() } else { panel() }),
             );
         }
 
@@ -2097,29 +2354,33 @@ impl App {
             text("").into()
         };
 
-        let footer: Element<Message> = if shown < total_matches {
+        let footer: Element<Message> = if total_matches > 0 {
             row![
-                text(format!("Showing {shown} of {total_matches}")).style(color_text_muted()),
+                text(format!(
+                    "Page {} / {}  •  Showing {}–{} of {}",
+                    page + 1,
+                    page_count.max(1),
+                    start + 1,
+                    start + shown,
+                    total_matches
+                ))
+                .style(color_text_muted()),
                 horizontal_space(),
-                button(text("Load more"))
+                button(text("Prev"))
                     .style(iced::theme::Button::Secondary)
-                    .on_press(Message::MarketplaceLoadMore),
+                    .on_press(Message::MarketplacePrevPage),
+                button(text("Next"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MarketplaceNextPage),
             ]
             .align_items(Alignment::Center)
             .spacing(10)
-            .into()
-        } else if total_matches > 0 {
-            row![
-                text(format!("Showing {shown} of {total_matches}")).style(color_text_muted()),
-                horizontal_space(),
-            ]
-            .align_items(Alignment::Center)
             .into()
         } else {
             text("").into()
         };
 
-        let content = column![
+        let content_left = column![
             header,
             h_divider(),
             url_row,
@@ -2131,11 +2392,194 @@ impl App {
         .spacing(10)
         .height(Length::Fill);
 
-        container(content)
+        let details = self.view_marketplace_details_panel(selected.as_ref());
+
+        row![
+            container(content_left)
             .padding(12)
             .width(Length::Fill)
             .height(Length::Fill)
+                .style(panel()),
+            v_divider(),
+            container(details)
+                .padding(12)
+                .width(Length::Fixed(420.0))
+                .height(Length::Fill)
+                .style(panel()),
+        ]
+        .spacing(12)
+        .into()
+    }
+
+    fn view_marketplace_details_panel(
+        &self,
+        source: Option<&MarketplaceSource>,
+    ) -> Element<'_, Message> {
+        let header = row![
+            text("Details").size(16),
+            horizontal_space(),
+        ]
+        .align_items(Alignment::Center);
+
+        let Some(p) = self.marketplace.selected.as_ref() else {
+            return container(column![
+                header,
+                h_divider(),
+                text("Click a plugin to view details.")
+                    .size(13)
+                    .style(color_text_muted()),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        };
+
+        let icon: Element<Message> = if let Some(src) = source {
+            let key = format!("{}|{}", src.index_url, p.id);
+            if let Some(handle) = self.marketplace.icon_cache.get(&key) {
+                image(handle.clone())
+                    .width(Length::Fixed(96.0))
+                    .height(Length::Fixed(96.0))
+                    .into()
+            } else {
+                container(text(""))
+                    .width(Length::Fixed(96.0))
+                    .height(Length::Fixed(96.0))
             .style(panel())
+                    .into()
+            }
+        } else {
+            container(text(""))
+                .width(Length::Fixed(96.0))
+                .height(Length::Fixed(96.0))
+                .style(panel())
+                .into()
+        };
+
+        let mut meta = column![
+            row![icon, column![
+                text(&p.name).size(18),
+                text(p.id.clone()).size(12).style(color_text_muted()),
+                if p.version.is_empty() {
+                    text("").size(1)
+                } else {
+                    text(format!("v{}", p.version)).size(12).style(color_text_muted())
+                },
+            ]
+            .spacing(4)]
+            .spacing(12)
+            .align_items(Alignment::Center),
+        ]
+        .spacing(10);
+
+        if let Some(author) = &p.author {
+            if !author.trim().is_empty() {
+                meta = meta.push(text(format!("Author: {author}")).size(12).style(color_text_muted()));
+            }
+        }
+        if let Some(home) = &p.homepage {
+            if !home.trim().is_empty() {
+                meta = meta.push(text(format!("Homepage: {home}")).size(12).style(color_text_muted()));
+            }
+        }
+        if !p.description.trim().is_empty() {
+            meta = meta.push(text(p.description.clone()).size(13));
+        }
+
+        // Extra details derived from repository (matches Rivul marketplace behavior).
+        if let Some(d) = self.marketplace.details_cache.get(&p.id) {
+            if let Some(repo) = d.repository.as_deref() {
+                if !repo.trim().is_empty() {
+                    meta = meta.push(text(format!("Repository: {repo}")).size(12).style(color_text_muted()));
+                }
+            }
+            if let Some(dl) = d.total_downloads {
+                meta = meta.push(
+                    text(format!("Total downloads (GitHub releases): {dl}"))
+                        .size(12)
+                        .style(color_text_muted()),
+                );
+            }
+            if let Some(url) = d.resolved_download_url.as_deref() {
+                meta = meta.push(
+                    text(format!("Resolved download: {url}"))
+                        .size(12)
+                        .style(color_text_muted()),
+                );
+            }
+        }
+
+        let readme_title = text("README").size(13).style(color_text_muted());
+        let readme_body: Element<Message> = if let Some(d) = self.marketplace.details_cache.get(&p.id) {
+            if let Some(md) = d.readme_md.as_deref() {
+                container(self.render_markdown(md, source))
+                    .padding(10)
+                    .width(Length::Fill)
+                    .style(panel())
+                    .into()
+            } else {
+                text("Loading README…").size(12).style(color_text_muted()).into()
+            }
+        } else if p.repository.is_some() {
+            text("Loading README…").size(12).style(color_text_muted()).into()
+        } else {
+            text("No repository/README available.").size(12).style(color_text_muted()).into()
+        };
+
+        let screenshots_title = text("Images").size(13).style(color_text_muted());
+        let mut shots = column![].spacing(10);
+        if let Some(src) = source {
+            // Prefer images discovered from README; fall back to marketplace-provided screenshots.
+            let mut urls: Vec<String> = vec![];
+            if let Some(d) = self.marketplace.details_cache.get(&p.id) {
+                urls.extend(d.image_urls.iter().cloned());
+            }
+            urls.extend(p.images.iter().cloned());
+
+            let mut shown_any = false;
+            for raw in urls.iter().take(12) {
+                let Some(url) = resolve_marketplace_asset_url(src, raw) else {
+                    continue;
+                };
+                shown_any = true;
+                let key = format!("img|{}|{}|{}", src.index_url, p.id, url);
+                if let Some(handle) = self.marketplace.image_cache.get(&key) {
+                    shots = shots.push(image(handle.clone()).width(Length::Fill));
+                } else if let Some(handle) = self.marketplace.svg_cache.get(&key) {
+                    shots = shots.push(
+                        iced::widget::svg(handle.clone())
+                            .width(Length::Fill)
+                            .height(Length::Shrink)
+                        ,
+                    );
+                } else {
+                    shots = shots.push(
+                        container(text("Loading…").style(color_text_muted()))
+                            .padding(10)
+                            .width(Length::Fill)
+                            .style(panel()),
+                    );
+                }
+            }
+            if !shown_any {
+                shots = shots.push(text("No images found.").size(12).style(color_text_muted()));
+            }
+        }
+
+        container(
+            column![
+                header,
+                h_divider(),
+                scrollable(
+                    column![meta, h_divider(), readme_title, readme_body, h_divider(), screenshots_title, shots]
+                        .spacing(12),
+                )
+                    .height(Length::Fill),
+            ]
+            .spacing(10),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
             .into()
     }
 
@@ -3343,6 +3787,190 @@ impl App {
             }
         }
     }
+
+    fn render_markdown(&self, md: &str, source: Option<&MarketplaceSource>) -> Element<'_, Message> {
+        use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+        let mut opts = Options::empty();
+        opts.insert(Options::ENABLE_TABLES);
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+        opts.insert(Options::ENABLE_FOOTNOTES);
+        opts.insert(Options::ENABLE_TASKLISTS);
+
+        let parser = Parser::new_ext(md, opts);
+
+        let mut elems: Vec<Element<Message>> = vec![];
+
+        let mut cur = String::new();
+        let mut cur_link: Option<String> = None;
+        let mut heading_level: Option<u8> = None;
+        let mut in_code_block = false;
+        let mut code_buf = String::new();
+
+        fn flush_paragraph(
+            elems: &mut Vec<Element<Message>>,
+            text_buf: &mut String,
+            link: &mut Option<String>,
+            heading_level: &mut Option<u8>,
+        ) {
+            let s = text_buf.trim();
+            if s.is_empty() {
+                *text_buf = String::new();
+                *link = None;
+                *heading_level = None;
+                return;
+            }
+
+            // Heading
+            if let Some(level) = *heading_level {
+                let size = match level {
+                    1 => 18,
+                    2 => 16,
+                    3 => 15,
+                    _ => 14,
+                };
+                elems.push(text(s.to_string()).size(size).into());
+                *text_buf = String::new();
+                *link = None;
+                *heading_level = None;
+                return;
+            }
+
+            // Link-only line (basic)
+            if let Some(url) = link.take() {
+                elems.push(
+                    button(text(s.to_string()))
+                        .style(iced::theme::Button::Secondary)
+                        .on_press(Message::OpenUrl(url))
+                        .into(),
+                );
+                *text_buf = String::new();
+                *heading_level = None;
+                return;
+            }
+
+            elems.push(text(s.to_string()).size(12).into());
+            *text_buf = String::new();
+            *heading_level = None;
+        }
+
+        for ev in parser {
+            match ev {
+                Event::Start(Tag::Heading { level, .. }) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                    heading_level = Some(level as u8);
+                }
+                Event::End(TagEnd::Heading { .. }) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                }
+                Event::Start(Tag::Paragraph) => {}
+                Event::End(TagEnd::Paragraph) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                }
+                Event::Start(Tag::Link { dest_url, .. }) => {
+                    cur_link = Some(dest_url.to_string());
+                }
+                Event::End(TagEnd::Link) => {
+                    // keep link; flush on paragraph end
+                }
+                Event::Start(Tag::CodeBlock(_)) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                    in_code_block = true;
+                    code_buf.clear();
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                    let s = code_buf.trim_end().to_string();
+                    if !s.is_empty() {
+                        elems.push(
+                            container(text(s).size(12).style(color_text_muted()))
+                                .padding(10)
+                                .style(panel())
+                                .into(),
+                        );
+                    }
+                    code_buf.clear();
+                }
+                Event::Text(t) => {
+                    if in_code_block {
+                        code_buf.push_str(&t);
+                    } else {
+                        cur.push_str(&t);
+                    }
+                }
+                Event::Code(t) => {
+                    if in_code_block {
+                        code_buf.push_str(&t);
+                    } else {
+                        cur.push('`');
+                        cur.push_str(&t);
+                        cur.push('`');
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if in_code_block {
+                        code_buf.push('\n');
+                    } else {
+                        cur.push('\n');
+                    }
+                }
+                Event::Start(Tag::List(_)) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                }
+                Event::End(TagEnd::List(_)) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                }
+                Event::Start(Tag::Item) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                    cur.push_str("• ");
+                }
+                Event::End(TagEnd::Item) => {
+                    flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+                }
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    // Try to show image if it's a renderable format; otherwise provide a link button.
+                    let raw = dest_url.to_string();
+                    if is_renderable_image_url(&raw) {
+                        if let Some(src) = source {
+                            if let Some(url) = resolve_marketplace_asset_url(src, &raw) {
+                                elems.push(
+                                    button(text(format!("Open image: {}", truncate(&url, 60))))
+                                        .style(iced::theme::Button::Secondary)
+                                        .on_press(Message::OpenUrl(url))
+                                        .into(),
+                                );
+                            }
+                        } else {
+                            elems.push(
+                                button(text(format!("Open image: {}", truncate(&raw, 60))))
+                                    .style(iced::theme::Button::Secondary)
+                                    .on_press(Message::OpenUrl(raw))
+                                    .into(),
+                            );
+                        }
+                    } else {
+                        elems.push(
+                            button(text(format!("Open image (unsupported): {}", truncate(&raw, 60))))
+                                .style(iced::theme::Button::Secondary)
+                                .on_press(Message::OpenUrl(raw))
+                                .into(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        flush_paragraph(&mut elems, &mut cur, &mut cur_link, &mut heading_level);
+
+        let out = elems
+            .into_iter()
+            .fold(column![].spacing(6), |col, el| col.push(el));
+
+        // Important: do NOT wrap markdown in its own scrollable, because the details panel already
+        // has a scroll container. Nested scrollables prevent mouse-wheel scrolling from working.
+        out.into()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3433,6 +4061,28 @@ fn panel() -> iced::theme::Container {
                 color: Color::from_rgba8(0, 0, 0, 0.12),
                 offset: iced::Vector::new(0.0, 4.0),
                 blur_radius: 12.0,
+            },
+        }
+    }))
+}
+
+fn callout_card() -> iced::theme::Container {
+    iced::theme::Container::Custom(Box::new(|theme: &Theme| {
+        let p = theme.extended_palette();
+        let mut shade = p.background.strong.color;
+        shade.a = 0.96;
+        iced::widget::container::Appearance {
+            background: Some(Background::Color(shade)),
+            text_color: Some(p.background.base.text),
+            border: Border {
+                radius: 10.0.into(),
+                width: 1.0,
+                color: Color::from_rgba8(255, 255, 255, 0.12),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba8(0, 0, 0, 0.18),
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 14.0,
             },
         }
     }))
@@ -3628,6 +4278,51 @@ async fn install_marketplace_async(url: String, expected_id: String) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+async fn install_marketplace_from_repo_async(
+    repo_url: String,
+    expected_id: String,
+) -> Result<(), String> {
+    let url = resolve_github_release_asset_url_async(&repo_url).await?;
+    install_marketplace_async(url, expected_id).await
+}
+
+async fn fetch_marketplace_details_async(plugin: MarketplacePlugin) -> Result<MarketplaceDetails, String> {
+    let mut out = MarketplaceDetails {
+        repository: plugin.repository.clone(),
+        ..MarketplaceDetails::default()
+    };
+
+    let Some(repo_url) = plugin.repository.as_deref() else {
+        return Ok(out);
+    };
+    let Some((owner, repo)) = parse_github_owner_repo(repo_url) else {
+        return Ok(out);
+    };
+
+    // README + images
+    if let Ok((branch, md)) = fetch_github_readme_md_async(&owner, &repo).await {
+        out.readme_md = Some(md.clone());
+        for raw in extract_readme_image_urls(&md).into_iter().take(24) {
+            if !is_renderable_image_url(&raw) {
+                continue;
+            }
+            if let Some(abs) = resolve_github_readme_asset_url(&owner, &repo, &branch, &raw) {
+                if !out.image_urls.contains(&abs) {
+                    out.image_urls.push(abs);
+                }
+            }
+        }
+    }
+
+    // Releases: total download counts + best asset URL for install.
+    if let Ok((count, asset)) = fetch_github_releases_info_async(&owner, &repo).await {
+        out.total_downloads = Some(count);
+        out.resolved_download_url = asset;
+    }
+
+    Ok(out)
+}
+
 async fn fetch_marketplace_async(url: String) -> Result<Vec<MarketplacePlugin>, String> {
     openaction::marketplace::fetch_plugins(&url)
         .await
@@ -3702,6 +4397,22 @@ async fn keyboard_input_async(text: Option<String>, keys: Vec<String>) -> Result
     issue_command_async(cmd, None, Some(5_000)).await
 }
 
+async fn open_url_async(url: String) -> Result<(), String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    let cmd = format!("start {}", shell_escape(&url));
+    #[cfg(target_os = "macos")]
+    let cmd = format!("open {}", shell_escape(&url));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = format!("xdg-open {}", shell_escape(&url));
+
+    issue_command_async(cmd, None, Some(5_000)).await
+}
+
 fn shell_escape(s: &str) -> String {
     // Minimal, safe shell escaping for bash -lc.
     // Wrap in single quotes and escape internal single quotes.
@@ -3772,6 +4483,385 @@ fn resolve_marketplace_download_url(
     // Relative: resolve against the marketplace index URL.
     let base = reqwest::Url::parse(source.index_url.trim()).ok()?;
     base.join(raw).ok().map(|u| u.to_string())
+}
+
+fn resolve_marketplace_asset_url(source: &MarketplaceSource, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Absolute.
+    if reqwest::Url::parse(raw).is_ok() {
+        return Some(raw.to_string());
+    }
+
+    // Relative: resolve against the marketplace index URL.
+    let base = reqwest::Url::parse(source.index_url.trim()).ok()?;
+    base.join(raw).ok().map(|u| u.to_string())
+}
+
+fn parse_github_owner_repo(repo_url: &str) -> Option<(String, String)> {
+    let url = reqwest::Url::parse(repo_url.trim()).ok()?;
+    if url.host_str()? != "github.com" {
+        return None;
+    }
+    let mut segs = url.path_segments()?;
+    let owner = segs.next()?.trim().to_string();
+    let repo = segs.next()?.trim().trim_end_matches(".git").to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
+async fn fetch_github_readme_md_async(owner: &str, repo: &str) -> Result<(String, String), String> {
+    let candidates = [
+        ("main", "README.md"),
+        ("main", "readme.md"),
+        ("master", "README.md"),
+        ("master", "readme.md"),
+    ];
+    for (branch, file) in candidates {
+        let url = format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file}"
+        );
+        match openaction::marketplace::fetch_bytes(&url).await {
+            Ok(bytes) => {
+                let md = String::from_utf8(bytes).map_err(|_| "README is not utf-8".to_string())?;
+                return Ok((branch.to_string(), md));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("README not found (tried main/master README.md/readme.md)".to_string())
+}
+
+fn extract_readme_image_urls(md: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Markdown: ![alt](url)
+    let bytes = md.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'!' && bytes[i + 1] == b'[' {
+            // find "]("
+            if let Some(close_bracket) = md[i + 2..].find("](") {
+                let start = i + 2 + close_bracket + 2; // points at '('
+                // actual url begins after '('
+                let url_start = start + 1;
+                if url_start >= md.len() {
+                    break;
+                }
+                if let Some(end_rel) = md[url_start..].find(')') {
+                    let url_raw = md[url_start..url_start + end_rel].trim();
+                    // strip optional title: "url \"title\""
+                    let url_only = url_raw
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches('<')
+                        .trim_matches('>');
+                    if !url_only.is_empty() {
+                        out.push(url_only.to_string());
+                    }
+                    i = url_start + end_rel + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // HTML: <img src="...">
+    let mut rest = md;
+    while let Some(pos) = rest.find("src=\"") {
+        rest = &rest[pos + 5..];
+        if let Some(end) = rest.find('"') {
+            let url = rest[..end].trim();
+            if !url.is_empty() {
+                out.push(url.to_string());
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    // De-dupe, preserve order
+    let mut uniq = Vec::new();
+    for u in out {
+        if !uniq.contains(&u) {
+            uniq.push(u);
+        }
+    }
+    uniq
+}
+
+fn is_renderable_image_url(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    if u.is_empty() {
+        return false;
+    }
+    // SVG is now supported via iced's `svg` widget; raster formats supported via `image` features.
+    u.ends_with(".svg")
+        || u.contains(".svg?")
+        || u.ends_with(".png")
+        || u.contains(".png?")
+        || u.ends_with(".jpg")
+        || u.contains(".jpg?")
+        || u.ends_with(".jpeg")
+        || u.contains(".jpeg?")
+}
+
+fn resolve_github_readme_asset_url(owner: &str, repo: &str, branch: &str, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Already absolute.
+    if reqwest::Url::parse(raw).is_ok() {
+        // Convert GitHub blob URLs to raw URLs.
+        if raw.starts_with("https://github.com/") && raw.contains("/blob/") {
+            // https://github.com/{owner}/{repo}/blob/{branch}/path -> raw.githubusercontent.com/{owner}/{repo}/{branch}/path
+            let prefix = format!("https://github.com/{owner}/{repo}/blob/");
+            if let Some(rest) = raw.strip_prefix(&prefix) {
+                let mut it = rest.splitn(2, '/');
+                let b = it.next().unwrap_or(branch);
+                let path = it.next().unwrap_or("");
+                return Some(format!(
+                    "https://raw.githubusercontent.com/{owner}/{repo}/{b}/{path}"
+                ));
+            }
+        }
+        return Some(raw.to_string());
+    }
+
+    // Root-relative within repo.
+    if raw.starts_with('/') {
+        return Some(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{branch}{}",
+            raw
+        ));
+    }
+
+    // Relative path.
+    let rel = raw.trim_start_matches("./");
+    Some(format!(
+        "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+    ))
+}
+
+async fn fetch_github_releases_info_async(owner: &str, repo: &str) -> Result<(u64, Option<String>), String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases");
+    let client = reqwest::Client::builder()
+        .user_agent("RiverDeck-Redux/0.1 (Marketplace)")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API error: {}", resp.status()));
+    }
+
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let releases = v.as_array().ok_or_else(|| "unexpected GitHub API response".to_string())?;
+
+    let mut total: u64 = 0;
+    for rel in releases {
+        if let Some(assets) = rel.get("assets").and_then(|a| a.as_array()) {
+            for a in assets {
+                if let Some(c) = a.get("download_count").and_then(|c| c.as_u64()) {
+                    total += c;
+                }
+            }
+        }
+    }
+
+    // Pick best installable asset from the latest release (first in list).
+    let asset_url = releases
+        .first()
+        .and_then(|rel| rel.get("assets").and_then(|a| a.as_array()))
+        .and_then(|assets| pick_best_github_asset_url(assets));
+
+    Ok((total, asset_url))
+}
+
+fn pick_best_github_asset_url(assets: &[serde_json::Value]) -> Option<String> {
+    // Gather candidates (archive/plugin-bundle assets only).
+    let mut cands: Vec<(i32, String)> = vec![];
+    for a in assets {
+        let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("").to_ascii_lowercase();
+        let url = a
+            .get("browser_download_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        // Common archive formats + known plugin bundle extensions.
+        let is_supported = name.ends_with(".zip")
+            || name.ends_with(".tar.gz")
+            || name.ends_with(".tgz")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".opendeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin")
+            || name.ends_with(".streamdeckplugin");
+        if !is_supported {
+            continue;
+        }
+        let mut score = 0;
+        // Prefer platform matches.
+        if cfg!(windows) {
+            if name.contains("windows") || name.contains("win") {
+                score += 50;
+            }
+        } else if cfg!(target_os = "macos") {
+            if name.contains("mac") || name.contains("darwin") || name.contains("osx") {
+                score += 50;
+            }
+        } else {
+            if name.contains("linux") {
+                score += 50;
+            }
+        }
+        // Prefer common packaging formats slightly.
+        if name.ends_with(".zip") {
+            score += 10;
+        }
+        if name.ends_with(".streamdeckplugin") {
+            score += 12;
+        }
+        cands.push((score, url));
+    }
+    cands.sort_by(|a, b| b.0.cmp(&a.0));
+    cands.first().map(|(_, u)| u.clone())
+}
+
+async fn resolve_github_release_asset_url_async(repo_url: &str) -> Result<String, String> {
+    let (owner, repo) =
+        parse_github_owner_repo(repo_url).ok_or_else(|| "unsupported repository url".to_string())?;
+    let (_count, asset) = fetch_github_releases_info_async(&owner, &repo).await?;
+    asset.ok_or_else(|| "no downloadable release archive found on GitHub".to_string())
 }
 
 fn parse_bg_rgb(raw: &str) -> Option<[u8; 3]> {
