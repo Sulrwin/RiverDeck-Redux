@@ -39,5 +39,9 @@ thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flate2 = "1.0"
+tar = "0.4"
+tempfile = "3.12"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 

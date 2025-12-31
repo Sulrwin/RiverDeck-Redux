@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         "events" => cmd_events(&args).await,
         "brightness" => cmd_brightness(&args).await,
         "test-image" => cmd_test_image(&args).await,
+        "plugins" => cmd_plugins(&args).await,
         other => anyhow::bail!("unknown command: {other} (run `cli help`)"),
     }
 }
@@ -33,6 +34,9 @@ USAGE:
   cli events <device_id>
   cli brightness <device_id> <percent>
   cli test-image <device_id> <key> <r> <g> <b>
+  cli plugins list
+  cli plugins install <url> [--id <expected_id>]
+  cli plugins uninstall <plugin_id>
 "#
     );
 }
@@ -88,6 +92,79 @@ async fn cmd_test_image(args: &[String]) -> anyhow::Result<()> {
     let jpeg = render::test_patterns::solid_color_jpeg(w, h, [r, g, b])?;
     dev.set_key_image_jpeg(key, jpeg).await?;
     println!("pushed test image to key {key}");
+    Ok(())
+}
+
+async fn cmd_plugins(args: &[String]) -> anyhow::Result<()> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+    match sub {
+        "help" | "--help" | "-h" => {
+            eprintln!(
+                r#"cli plugins
+
+USAGE:
+  cli plugins list
+  cli plugins install <url> [--id <expected_id>]
+  cli plugins uninstall <plugin_id>
+"#
+            );
+            Ok(())
+        }
+        "list" => cmd_plugins_list(),
+        "install" => cmd_plugins_install(args).await,
+        "uninstall" => cmd_plugins_uninstall(args),
+        other => anyhow::bail!("unknown plugins subcommand: {other} (run `cli plugins help`)"),
+    }
+}
+
+fn cmd_plugins_list() -> anyhow::Result<()> {
+    let plugins = openaction::registry::list_installed()?;
+    if plugins.is_empty() {
+        println!("(no plugins installed)");
+        return Ok(());
+    }
+    for p in plugins {
+        let v = if p.manifest.version.is_empty() {
+            "".to_string()
+        } else {
+            format!(" v{}", p.manifest.version)
+        };
+        println!("{}  {}{}", p.manifest.id, p.manifest.name, v);
+    }
+    Ok(())
+}
+
+async fn cmd_plugins_install(args: &[String]) -> anyhow::Result<()> {
+    let url = args
+        .get(3)
+        .ok_or_else(|| anyhow::anyhow!("missing url (usage: cli plugins install <url> [--id <expected_id>])"))?
+        .as_str();
+
+    let mut expected_id: Option<&str> = None;
+    let mut i = 4;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--id requires a value"))?;
+                expected_id = Some(v.as_str());
+                i += 2;
+            }
+            other => anyhow::bail!("unknown flag for plugins install: {other}"),
+        }
+    }
+
+    let id = openaction::installer::install_from_url(url, expected_id).await?;
+    println!("installed: {id}");
+    Ok(())
+}
+
+fn cmd_plugins_uninstall(args: &[String]) -> anyhow::Result<()> {
+    let id = args
+        .get(3)
+        .ok_or_else(|| anyhow::anyhow!("missing plugin_id (usage: cli plugins uninstall <plugin_id>)"))?
+        .as_str();
+    openaction::registry::uninstall(id)?;
+    println!("uninstalled: {id}");
     Ok(())
 }
 

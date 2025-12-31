@@ -123,6 +123,7 @@ struct MarketplaceState {
     error: Option<String>,
     icon_cache: HashMap<String, iced::widget::image::Handle>,
     visible: usize,
+    installing: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +218,7 @@ impl Application for App {
                 error: None,
                 icon_cache: HashMap::new(),
                 visible: MARKETPLACE_PAGE_SIZE,
+                installing: None,
             },
             error: None,
             next_action_seq_id: 1,
@@ -776,6 +778,45 @@ impl Application for App {
                 }
                 Command::none()
             }
+            Message::MarketplaceInstall(p) => {
+                if self.marketplace.installing.is_some() {
+                    return Command::none();
+                }
+
+                let Some(src) = self.current_marketplace_source().cloned() else {
+                    self.marketplace.error = Some("No marketplace selected.".to_string());
+                    return Command::none();
+                };
+
+                let Some(url) = resolve_marketplace_download_url(&src, &p) else {
+                    self.marketplace.error = Some("Plugin has no download URL.".to_string());
+                    return Command::none();
+                };
+
+                if self.plugins.iter().any(|ip| ip.manifest.id == p.id) {
+                    return Command::none();
+                }
+
+                self.marketplace.installing = Some(p.id.clone());
+                self.marketplace.error = None;
+                Command::perform(
+                    install_marketplace_async(url, p.id),
+                    Message::MarketplaceInstalled,
+                )
+            }
+            Message::MarketplaceInstalled(res) => {
+                self.marketplace.installing = None;
+                match res {
+                    Ok(()) => {
+                        self.marketplace.error = None;
+                        Command::perform(list_plugins_async(), Message::PluginsLoaded)
+                    }
+                    Err(e) => {
+                        self.marketplace.error = Some(e);
+                        Command::none()
+                    }
+                }
+            }
             Message::MarketplaceLoadMore => {
                 let prev = self.marketplace.visible;
                 self.marketplace.visible = self
@@ -1273,6 +1314,8 @@ enum Message {
     MarketplaceLoaded(Result<Vec<MarketplacePlugin>, String>),
     MarketplaceIconLoaded { key: String, bytes: Result<Vec<u8>, String> },
     MarketplaceLoadMore,
+    MarketplaceInstall(MarketplacePlugin),
+    MarketplaceInstalled(Result<(), String>),
     ActionSeqContinue(u64),
     ActionSeqStepDone { seq_id: u64, res: Result<(), String> },
     ActionModePicked(ActionModeChoice),
@@ -2010,8 +2053,21 @@ impl App {
                 body = body.push(text(p.description.clone()).size(12).style(color_text_muted()));
             }
 
-            let install_btn = if p.download_url.is_some() {
-                button(text("Install")).style(iced::theme::Button::Secondary)
+            let is_installed = self.plugins.iter().any(|ip| ip.manifest.id == p.id);
+            let is_installing = self
+                .marketplace
+                .installing
+                .as_deref()
+                .is_some_and(|id| id == p.id);
+
+            let install_btn = if is_installed {
+                button(text("Installed")).style(iced::theme::Button::Secondary)
+            } else if is_installing {
+                button(text("Installing…")).style(iced::theme::Button::Secondary)
+            } else if p.download_url.is_some() {
+                button(text("Install"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MarketplaceInstall(p.clone()))
             } else {
                 button(text("Install")).style(iced::theme::Button::Secondary)
             };
@@ -3565,6 +3621,13 @@ async fn install_plugin_async(path: String) -> Result<(), String> {
     openaction::registry::install_local_dir(Path::new(&path)).map_err(|e| e.to_string())
 }
 
+async fn install_marketplace_async(url: String, expected_id: String) -> Result<(), String> {
+    openaction::installer::install_from_url(&url, Some(&expected_id))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 async fn fetch_marketplace_async(url: String) -> Result<Vec<MarketplacePlugin>, String> {
     openaction::marketplace::fetch_plugins(&url)
         .await
@@ -3690,6 +3753,25 @@ fn marketplace_icon_url(source: &MarketplaceSource, plugin: &MarketplacePlugin) 
     out.push_str(&plugin.id);
     out.push_str(".png");
     Some(out)
+}
+
+fn resolve_marketplace_download_url(
+    source: &MarketplaceSource,
+    plugin: &MarketplacePlugin,
+) -> Option<String> {
+    let raw = plugin.download_url.as_ref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Absolute.
+    if reqwest::Url::parse(raw).is_ok() {
+        return Some(raw.to_string());
+    }
+
+    // Relative: resolve against the marketplace index URL.
+    let base = reqwest::Url::parse(source.index_url.trim()).ok()?;
+    base.join(raw).ok().map(|u| u.to_string())
 }
 
 fn parse_bg_rgb(raw: &str) -> Option<[u8; 3]> {

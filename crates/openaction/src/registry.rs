@@ -83,6 +83,67 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install a plugin directory using an atomic replace strategy.
+///
+/// - Copies `src` into a temporary directory inside the plugins dir
+/// - Removes any existing `plugins/<id>`
+/// - Renames the temp dir into place
+pub fn install_dir_atomic(src: &Path, expected_id: Option<&str>) -> anyhow::Result<()> {
+    let manifest = load_manifest(src)?;
+    if manifest.id.trim().is_empty() {
+        anyhow::bail!("manifest id is empty");
+    }
+    if let Some(expected) = expected_id {
+        if manifest.id != expected {
+            anyhow::bail!(
+                "manifest id mismatch (expected {expected}, got {})",
+                manifest.id
+            );
+        }
+    }
+
+    let plugins_dir = ensure_plugins_dir()?;
+    let final_dir = plugins_dir.join(&manifest.id);
+
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!(".installing-{}-", manifest.id))
+        .tempdir_in(&plugins_dir)?;
+    let tmp_path = tmp.keep();
+
+    let res = (|| {
+        copy_dir_recursive(src, &tmp_path)?;
+
+        // Best-effort atomic replace. On Windows, rename over existing may fail; remove first.
+        if cfg!(windows) && final_dir.exists() {
+            let _ = fs::remove_dir_all(&final_dir);
+        }
+        if final_dir.exists() {
+            fs::remove_dir_all(&final_dir)?;
+        }
+
+        fs::rename(&tmp_path, &final_dir)?;
+        Ok(())
+    })();
+
+    if res.is_err() {
+        let _ = fs::remove_dir_all(&tmp_path);
+    }
+    res
+}
+
+/// Uninstall a plugin by id (removes `data_dir/plugins/<id>`).
+pub fn uninstall(plugin_id: &str) -> anyhow::Result<()> {
+    let id = plugin_id.trim();
+    if id.is_empty() {
+        anyhow::bail!("plugin id is empty");
+    }
+    let dir = ensure_plugins_dir()?.join(id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
 pub fn plugin_executable_path(plugin: &InstalledPlugin) -> Option<PathBuf> {
     let m = &plugin.manifest;
     let rel = if let Some(exe) = &m.executable {
