@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-const PROFILE_SCHEMA_VERSION: u32 = 2;
+const PROFILE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -17,6 +17,37 @@ pub struct Profile {
     pub name: String,
     pub key_count: u8,
     pub keys: Vec<KeyConfig>,
+    /// Stream Deck+ has 4 dials; other devices will typically leave this empty.
+    #[serde(default)]
+    pub dials: Vec<DialConfig>,
+    /// Stream Deck+ touch strip config; defaults to an empty config for non-plus devices.
+    #[serde(default)]
+    pub touch_strip: TouchStripConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Background {
+    None,
+    Solid { rgb: [u8; 3] },
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        Background::None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Appearance {
+    #[serde(default)]
+    pub background: Background,
+    /// Optional path to an icon image (PNG/JPEG). UI/runtime resolve this on render.
+    #[serde(default)]
+    pub icon_path: Option<String>,
+    /// Optional single-line text rendered on the LCD surface.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -25,15 +56,35 @@ pub struct KeyConfig {
     /// OpenAction bindings will later live alongside this.
     pub label: String,
     #[serde(default)]
-    pub action: Option<ActionBinding>,
+    pub action: Option<actions::ActionBinding>,
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionBinding {
-    pub plugin_id: String,
-    pub action_id: String,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DialConfig {
     #[serde(default)]
-    pub settings: serde_json::Value,
+    pub label: String,
+    /// Invoked on dial press (down).
+    #[serde(default)]
+    pub press: Option<actions::ActionBinding>,
+    /// Invoked on dial rotate (delta provided to plugin payload; builtins may ignore).
+    #[serde(default)]
+    pub rotate: Option<actions::ActionBinding>,
+    #[serde(default)]
+    pub appearance: Appearance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TouchStripConfig {
+    /// Invoked on touch tap.
+    #[serde(default)]
+    pub tap: Option<actions::ActionBinding>,
+    /// Invoked on touch drag/swipe.
+    #[serde(default)]
+    pub drag: Option<actions::ActionBinding>,
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 #[derive(Debug, Clone)]
@@ -86,11 +137,18 @@ pub fn create_profile(name: &str, key_count: u8) -> anyhow::Result<Profile> {
         name: name.to_string(),
         key_count,
         keys: vec![KeyConfig::default(); key_count as usize],
+        dials: if key_count == 8 {
+            vec![DialConfig::default(); 4]
+        } else {
+            vec![]
+        },
+        touch_strip: TouchStripConfig::default(),
     };
 
     // Give the first profile a minimal default label so UI looks alive.
     if let Some(first) = profile.keys.first_mut() {
         first.label = "Key 0".to_string();
+        first.appearance.text = Some(first.label.clone());
     }
 
     Ok(profile)
@@ -117,6 +175,16 @@ pub fn load_profile(path: &Path) -> anyhow::Result<Profile> {
         p.version = 2;
     }
 
+    if p.version == 2 {
+        // v2 -> v3: schema is compatible; builtin actions can now be stored in `action`.
+        p.version = 3;
+    }
+
+    if p.version == 3 {
+        // v3 -> v4: add dials/touch strip + appearance fields (defaults filled by serde).
+        p.version = 4;
+    }
+
     if p.version != PROFILE_SCHEMA_VERSION {
         anyhow::bail!("unsupported profile version: {}", p.version);
     }
@@ -124,6 +192,11 @@ pub fn load_profile(path: &Path) -> anyhow::Result<Profile> {
     // Basic integrity.
     if p.keys.len() != p.key_count as usize {
         p.keys.resize_with(p.key_count as usize, KeyConfig::default);
+    }
+
+    // Stream Deck+ convenience: ensure 4 dials if key_count suggests a Plus layout.
+    if p.key_count == 8 && p.dials.len() != 4 {
+        p.dials.resize_with(4, DialConfig::default);
     }
 
     Ok(p)

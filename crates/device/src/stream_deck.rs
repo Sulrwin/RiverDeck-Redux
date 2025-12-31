@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 use transport_hid::{HidContext, HidDeviceHandle, HidDiscoveredDevice};
 
-use crate::{ConnectedDevice, DeviceEvent, DiscoveredDevice};
+use crate::{ConnectedDevice, ControlEvent, ControlEventKind, ControlId, DeviceEvent, DiscoveredDevice};
 
 // Elgato Systems GmbH
 const ELGATO_VENDOR_ID: u16 = 0x0fd9;
@@ -146,12 +146,13 @@ impl StreamDeckService {
 
         let name = candidates[0].name.clone();
         let product_lower = name.to_ascii_lowercase();
+        let is_plus = product_lower.contains("plus") || product_lower.contains("stream deck +");
         let key_count = match candidates[0].product_id {
             0x0063 => 6,  // Mini
             0x006c => 32, // XL (common)
             _ => {
                 // Heuristic: Stream Deck+ is 8 keys (2x4) + touch strip + 4 dials.
-                if product_lower.contains("plus") || product_lower.contains("stream deck +") {
+                if is_plus {
                     8
                 } else {
                     15 // Original/MK.2 default
@@ -166,7 +167,7 @@ impl StreamDeckService {
 
         thread::spawn(move || {
             if let Err(err) =
-                run_stream_deck_thread(ctx, read_path, write_path, key_count, event_tx, cmd_rx)
+                run_stream_deck_thread(ctx, read_path, write_path, key_count, is_plus, event_tx, cmd_rx)
             {
                 warn!(?err, "device thread terminated with error");
             }
@@ -187,6 +188,7 @@ fn run_stream_deck_thread(
     read_path: Vec<u8>,
     write_path: Vec<u8>,
     key_count: u8,
+    is_plus: bool,
     event_tx: mpsc::Sender<DeviceEvent>,
     mut cmd_rx: mpsc::Receiver<DeviceCommand>,
 ) -> anyhow::Result<()> {
@@ -199,6 +201,7 @@ fn run_stream_deck_thread(
     debug!(key_count, "stream deck device thread started");
 
     let mut last_keys: Vec<bool> = vec![false; key_count as usize];
+    let mut last_dials_down: [bool; 4] = [false; 4];
     let mut buf = vec![0u8; 64];
 
     loop {
@@ -218,14 +221,31 @@ fn run_stream_deck_thread(
                     let r = set_key_image_v1_jpeg(&mut write_dev, key, &jpeg);
                     let _ = resp.send(r);
                 }
+                DeviceCommand::SetDialImageJpeg { dial, jpeg, resp } => {
+                    // MVP heuristic for Stream Deck+:
+                    // treat dial LCDs as "virtual keys" after the 8 physical keys.
+                    let key = 8u8.saturating_add(dial.min(3));
+                    let r = set_key_image_v1_jpeg(&mut write_dev, key, &jpeg);
+                    let _ = resp.send(r);
+                }
+                DeviceCommand::SetTouchStripImageJpeg { jpeg, resp } => {
+                    // MVP heuristic for Stream Deck+:
+                    // treat touch strip as the next "virtual key" after keys+dials.
+                    let key = 12u8;
+                    let r = set_key_image_v1_jpeg(&mut write_dev, key, &jpeg);
+                    let _ = resp.send(r);
+                }
             }
         }
 
         // 2) Read key state report (non-blocking).
         match read_dev.read_timeout(&mut buf, 20) {
             Ok(n) if n > 0 => {
-                if let Some(states) = parse_key_states_v1(&buf[..n], key_count) {
+                let report = &buf[..n];
+                if let Some(states) = parse_key_states_v1(report, key_count) {
                     emit_key_events(&mut last_keys, &states, &event_tx);
+                } else if is_plus {
+                    emit_plus_events(report, &mut last_dials_down, &event_tx);
                 }
             }
             Ok(_) => {}
@@ -246,11 +266,15 @@ fn emit_key_events(last: &mut [bool], current: &[bool], tx: &mpsc::Sender<Device
             continue;
         }
         let key = i as u8;
-        let ev = if now {
-            DeviceEvent::KeyDown { key }
+        let kind = if now {
+            ControlEventKind::Down
         } else {
-            DeviceEvent::KeyUp { key }
+            ControlEventKind::Up
         };
+        let ev = DeviceEvent::Control(ControlEvent {
+            control: ControlId::Key(key),
+            kind,
+        });
         let _ = tx.blocking_send(ev);
     }
     last.copy_from_slice(current);
@@ -274,6 +298,72 @@ fn parse_key_states_v1(report: &[u8], key_count: u8) -> Option<Vec<bool>> {
             .map(|b| *b != 0)
             .collect(),
     )
+}
+
+fn emit_plus_events(report: &[u8], last_dials_down: &mut [bool; 4], tx: &mpsc::Sender<DeviceEvent>) {
+    // Stream Deck+ support in this repo is intentionally MVP-level.
+    //
+    // The device exposes additional HID reports for dials and the touch strip.
+    // We parse a few conservative patterns and ignore anything unknown.
+    //
+    // Note: The exact report formats vary by firmware/platform; this is a best-effort decoder.
+
+    if report.is_empty() {
+        return;
+    }
+
+    match report[0] {
+        // Heuristic: some firmwares append dial-press bytes after key bytes in the same 0x01 report.
+        0x01 => {
+            // report[1..] starts with key_count bytes; if there are 4 more bytes, treat them as dial-down states.
+            if report.len() < 1 + 8 + 4 {
+                return;
+            }
+            let dial_start = 1 + 8;
+            for i in 0..4usize {
+                let now = report.get(dial_start + i).copied().unwrap_or(0) != 0;
+                if last_dials_down[i] == now {
+                    continue;
+                }
+                last_dials_down[i] = now;
+                let ev = DeviceEvent::Control(ControlEvent {
+                    control: ControlId::Dial(i as u8),
+                    kind: if now { ControlEventKind::Down } else { ControlEventKind::Up },
+                });
+                let _ = tx.blocking_send(ev);
+            }
+        }
+        // Heuristic: dial rotation report: [0x03, dial_index, delta_i8]
+        0x03 if report.len() >= 3 => {
+            let dial = report[1].min(3);
+            let delta = report[2] as i8 as i32;
+            if delta != 0 {
+                let _ = tx.blocking_send(DeviceEvent::Control(ControlEvent {
+                    control: ControlId::Dial(dial),
+                    kind: ControlEventKind::Rotate { delta },
+                }));
+            }
+        }
+        // Heuristic: touch strip tap report: [0x04, x_lo, x_hi]
+        0x04 if report.len() >= 3 => {
+            let x = u16::from_le_bytes([report[1], report[2]]);
+            let _ = tx.blocking_send(DeviceEvent::Control(ControlEvent {
+                control: ControlId::TouchStrip,
+                kind: ControlEventKind::Tap { x },
+            }));
+        }
+        // Heuristic: touch strip drag report: [0x05, dx_lo, dx_hi]
+        0x05 if report.len() >= 3 => {
+            let dx = i16::from_le_bytes([report[1], report[2]]);
+            if dx != 0 {
+                let _ = tx.blocking_send(DeviceEvent::Control(ControlEvent {
+                    control: ControlId::TouchStrip,
+                    kind: ControlEventKind::Drag { delta_x: dx },
+                }));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn set_brightness_v1(dev: &mut HidDeviceHandle, percent: u8) -> anyhow::Result<()> {
@@ -333,6 +423,15 @@ enum DeviceCommand {
         jpeg: Vec<u8>,
         resp: oneshot::Sender<anyhow::Result<()>>,
     },
+    SetDialImageJpeg {
+        dial: u8,
+        jpeg: Vec<u8>,
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    SetTouchStripImageJpeg {
+        jpeg: Vec<u8>,
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 #[derive(Clone)]
@@ -359,6 +458,30 @@ impl StreamDeckHandle {
                 jpeg,
                 resp: tx,
             })
+            .await
+            .map_err(|_| anyhow::anyhow!("device thread stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("device thread stopped"))?
+    }
+
+    pub async fn set_dial_image_jpeg(&self, dial: u8, jpeg: Vec<u8>) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DeviceCommand::SetDialImageJpeg {
+                dial,
+                jpeg,
+                resp: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("device thread stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("device thread stopped"))?
+    }
+
+    pub async fn set_touch_strip_image_jpeg(&self, jpeg: Vec<u8>) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DeviceCommand::SetTouchStripImageJpeg { jpeg, resp: tx })
             .await
             .map_err(|_| anyhow::anyhow!("device thread stopped"))?;
         rx.await

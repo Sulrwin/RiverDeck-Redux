@@ -1,11 +1,18 @@
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::time::Duration;
+use std::time::Instant;
 use std::{fmt, sync::Arc};
 
+use actions::{ActionBinding, ActionStep, BuiltinAction, PluginActionBinding};
 use app_core::AppCore;
-use device::{DeviceController, DeviceEvent, DeviceService, DiscoveredDevice, HidDeviceService};
+use device::{
+    ControlEventKind, ControlId, DeviceController, DeviceEvent, DeviceService, DiscoveredDevice,
+    HidDeviceService,
+};
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, horizontal_space, pick_list, row,
-    scrollable, slider, text, text_input,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, image, mouse_area,
+    pick_list, row, scrollable, slider, text, text_input,
 };
 use iced::{
     alignment::Horizontal, Alignment, Application, Background, Border, Color, Command, Element,
@@ -14,12 +21,12 @@ use iced::{
 use tokio::sync::mpsc::Receiver;
 
 use app_core::ids::ProfileId;
-use storage::profiles::{ActionBinding, Profile, ProfileMeta};
+use storage::profiles::{Profile, ProfileMeta};
 
 use openaction::manifest::{ActionDefinition, SettingField, SettingType};
 use openaction::marketplace::MarketplacePlugin;
 use openaction::registry::InstalledPlugin;
-use plugin_runtime::ActionRuntime;
+use plugin_runtime::{ActionRuntime, InvocationControl, InvocationEvent};
 
 fn main() -> iced::Result {
     init_tracing();
@@ -51,8 +58,12 @@ struct App {
     profile_choices: Vec<ProfileChoice>,
     selected_profile: Option<ProfileId>,
     profile: Option<Profile>,
-    selected_key: Option<usize>,
+    selected_control: Option<SelectedControl>,
+    selected_binding_target: BindingTarget,
     edit_label: String,
+    edit_bg_rgb: String,
+    edit_icon_path: String,
+    edit_display_text: String,
     plugins: Vec<InstalledPlugin>,
     actions: Vec<ActionChoice>,
     action_search: String,
@@ -60,6 +71,40 @@ struct App {
     active_view: ActiveView,
     marketplace: MarketplaceState,
     error: Option<String>,
+    next_action_seq_id: u64,
+    action_sequences: HashMap<u64, ActionSequence>,
+    sys: sysinfo::System,
+    sys_last_refresh: Instant,
+    sys_snapshot: SystemSnapshot,
+    drag: DragState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedControl {
+    Key(usize),
+    Dial(usize),
+    TouchStrip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingTarget {
+    KeyPress,
+    DialPress,
+    DialRotate,
+    TouchTap,
+    TouchDrag,
+}
+
+impl fmt::Display for BindingTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BindingTarget::KeyPress => write!(f, "Key press"),
+            BindingTarget::DialPress => write!(f, "Dial press"),
+            BindingTarget::DialRotate => write!(f, "Dial rotate"),
+            BindingTarget::TouchTap => write!(f, "Touch tap"),
+            BindingTarget::TouchDrag => write!(f, "Touch drag"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,14 +121,51 @@ struct MarketplaceState {
     plugins: Vec<MarketplacePlugin>,
     query: String,
     error: Option<String>,
-    new_source_name: String,
-    new_source_url: String,
+    icon_cache: HashMap<String, iced::widget::image::Handle>,
+    visible: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ActionSequence {
+    origin_control: InvocationControl,
+    origin_event: InvocationEvent,
+    steps: VecDeque<ActionStep>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SystemSnapshot {
+    cpu_percent: f32,
+    mem_used: u64,
+    mem_total: u64,
+    load: (f64, f64, f64),
+}
+
+#[derive(Debug, Clone, Default)]
+struct DragState {
+    dragging: Option<DraggedAction>,
+    over_key: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum DraggedAction {
+    Plugin(ActionChoice),
+    Builtin(BuiltinKindChoice),
+}
+
+impl DraggedAction {
+    fn label(&self) -> String {
+        match self {
+            DraggedAction::Plugin(a) => a.label.clone(),
+            DraggedAction::Builtin(k) => k.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MarketplaceSource {
     name: String,
     index_url: String,
+    icon_base_url: Option<String>,
 }
 
 impl fmt::Display for MarketplaceSource {
@@ -91,6 +173,8 @@ impl fmt::Display for MarketplaceSource {
         write!(f, "{}", self.name)
     }
 }
+
+const MARKETPLACE_PAGE_SIZE: usize = 50;
 
 impl Application for App {
     type Executor = iced::executor::Default;
@@ -113,8 +197,12 @@ impl Application for App {
             profile_choices: vec![],
             selected_profile: None,
             profile: None,
-            selected_key: None,
+            selected_control: None,
+            selected_binding_target: BindingTarget::KeyPress,
             edit_label: String::new(),
+            edit_bg_rgb: String::new(),
+            edit_icon_path: String::new(),
+            edit_display_text: String::new(),
             plugins: vec![],
             actions: vec![],
             action_search: String::new(),
@@ -127,10 +215,16 @@ impl Application for App {
                 plugins: vec![],
                 query: String::new(),
                 error: None,
-                new_source_name: String::new(),
-                new_source_url: String::new(),
+                icon_cache: HashMap::new(),
+                visible: MARKETPLACE_PAGE_SIZE,
             },
             error: None,
+            next_action_seq_id: 1,
+            action_sequences: HashMap::new(),
+            sys: sysinfo::System::new(),
+            sys_last_refresh: Instant::now(),
+            sys_snapshot: SystemSnapshot::default(),
+            drag: DragState::default(),
         };
 
         let cmd = Command::batch([
@@ -195,8 +289,11 @@ impl Application for App {
             Message::DevicePicked(choice) => {
                 let id = choice.id;
                 self.selected_device = Some(id);
-                self.selected_key = None;
+                self.selected_control = None;
                 self.edit_label.clear();
+                self.edit_bg_rgb.clear();
+                self.edit_icon_path.clear();
+                self.edit_display_text.clear();
                 self.profile = None;
                 self.selected_profile = None;
                 self.profiles.clear();
@@ -301,8 +398,11 @@ impl Application for App {
             }
             Message::ProfilePicked(choice) => {
                 self.selected_profile = Some(choice.id);
-                self.selected_key = None;
+                self.selected_control = None;
                 self.edit_label.clear();
+                self.edit_bg_rgb.clear();
+                self.edit_icon_path.clear();
+                self.edit_display_text.clear();
                 Command::perform(load_profile_async(choice.id), Message::ProfileLoaded)
             }
             Message::CreateProfile => {
@@ -316,8 +416,11 @@ impl Application for App {
                 Ok(p) => {
                     self.selected_profile = Some(p.id);
                     self.profile = Some(p);
-                    self.selected_key = None;
+                    self.selected_control = None;
                     self.edit_label.clear();
+                    self.edit_bg_rgb.clear();
+                    self.edit_icon_path.clear();
+                    self.edit_display_text.clear();
                     Command::perform(list_profiles_async(), Message::ProfilesLoaded)
                 }
                 Err(e) => {
@@ -339,20 +442,159 @@ impl Application for App {
                 }
                 Command::none()
             }
-            Message::SelectKey(idx) => {
-                self.selected_key = Some(idx);
+            Message::SelectControl(sel) => {
+                self.selected_control = Some(sel);
+                self.selected_binding_target = match sel {
+                    SelectedControl::Key(_) => BindingTarget::KeyPress,
+                    SelectedControl::Dial(_) => BindingTarget::DialPress,
+                    SelectedControl::TouchStrip => BindingTarget::TouchTap,
+                };
+
+                self.edit_label.clear();
+                self.edit_bg_rgb.clear();
+                self.edit_icon_path.clear();
+                self.edit_display_text.clear();
+
                 if let Some(p) = &self.profile {
-                    if let Some(k) = p.keys.get(idx) {
-                        self.edit_label = k.label.clone();
+                    match sel {
+                        SelectedControl::Key(idx) => {
+                            if let Some(k) = p.keys.get(idx) {
+                                self.edit_label = k.label.clone();
+                                self.edit_icon_path = k.appearance.icon_path.clone().unwrap_or_default();
+                                self.edit_display_text = k.appearance.text.clone().unwrap_or_default();
+                                self.edit_bg_rgb = match k.appearance.background {
+                                    storage::profiles::Background::Solid { rgb } => {
+                                        format!("{},{},{}", rgb[0], rgb[1], rgb[2])
+                                    }
+                                    storage::profiles::Background::None => String::new(),
+                                };
+                            }
+                        }
+                        SelectedControl::Dial(idx) => {
+                            if let Some(d) = p.dials.get(idx) {
+                                self.edit_label = d.label.clone();
+                                self.edit_icon_path = d.appearance.icon_path.clone().unwrap_or_default();
+                                self.edit_display_text = d.appearance.text.clone().unwrap_or_default();
+                                self.edit_bg_rgb = match d.appearance.background {
+                                    storage::profiles::Background::Solid { rgb } => {
+                                        format!("{},{},{}", rgb[0], rgb[1], rgb[2])
+                                    }
+                                    storage::profiles::Background::None => String::new(),
+                                };
+                            }
+                        }
+                        SelectedControl::TouchStrip => {
+                            let a = &p.touch_strip.appearance;
+                            self.edit_icon_path = a.icon_path.clone().unwrap_or_default();
+                            self.edit_display_text = a.text.clone().unwrap_or_default();
+                            self.edit_bg_rgb = match a.background {
+                                storage::profiles::Background::Solid { rgb } => {
+                                    format!("{},{},{}", rgb[0], rgb[1], rgb[2])
+                                }
+                                storage::profiles::Background::None => String::new(),
+                            };
+                        }
                     }
                 }
+
                 Command::none()
             }
             Message::LabelChanged(val) => {
                 self.edit_label = val;
-                if let (Some(idx), Some(p)) = (self.selected_key, &mut self.profile) {
-                    if let Some(k) = p.keys.get_mut(idx) {
-                        k.label = self.edit_label.clone();
+                if let (Some(sel), Some(p)) = (self.selected_control, &mut self.profile) {
+                    match sel {
+                        SelectedControl::Key(idx) => {
+                            if let Some(k) = p.keys.get_mut(idx) {
+                                k.label = self.edit_label.clone();
+                                // Keep default display text in sync unless user customized it.
+                                if k.appearance.text.as_deref().unwrap_or("").is_empty() {
+                                    k.appearance.text = Some(k.label.clone());
+                                    self.edit_display_text = k.label.clone();
+                                }
+                            }
+                        }
+                        SelectedControl::Dial(idx) => {
+                            if let Some(d) = p.dials.get_mut(idx) {
+                                d.label = self.edit_label.clone();
+                            }
+                        }
+                        SelectedControl::TouchStrip => {}
+                    }
+                }
+                Command::none()
+            }
+            Message::BindingTargetPicked(t) => {
+                self.selected_binding_target = t;
+                Command::none()
+            }
+            Message::BgRgbChanged(v) => {
+                self.edit_bg_rgb = v;
+                if let (Some(sel), Some(p)) = (self.selected_control, &mut self.profile) {
+                    let bg = parse_bg_rgb(&self.edit_bg_rgb);
+                    let background = bg
+                        .map(|rgb| storage::profiles::Background::Solid { rgb })
+                        .unwrap_or(storage::profiles::Background::None);
+
+                    match sel {
+                        SelectedControl::Key(idx) => {
+                            if let Some(k) = p.keys.get_mut(idx) {
+                                k.appearance.background = background;
+                            }
+                        }
+                        SelectedControl::Dial(idx) => {
+                            if let Some(d) = p.dials.get_mut(idx) {
+                                d.appearance.background = background;
+                            }
+                        }
+                        SelectedControl::TouchStrip => {
+                            p.touch_strip.appearance.background = background;
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::IconPathChanged(v) => {
+                self.edit_icon_path = v;
+                if let (Some(sel), Some(p)) = (self.selected_control, &mut self.profile) {
+                    let val = self.edit_icon_path.trim();
+                    let new = if val.is_empty() { None } else { Some(val.to_string()) };
+                    match sel {
+                        SelectedControl::Key(idx) => {
+                            if let Some(k) = p.keys.get_mut(idx) {
+                                k.appearance.icon_path = new;
+                            }
+                        }
+                        SelectedControl::Dial(idx) => {
+                            if let Some(d) = p.dials.get_mut(idx) {
+                                d.appearance.icon_path = new;
+                            }
+                        }
+                        SelectedControl::TouchStrip => {
+                            p.touch_strip.appearance.icon_path = new;
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::DisplayTextChanged(v) => {
+                self.edit_display_text = v;
+                if let (Some(sel), Some(p)) = (self.selected_control, &mut self.profile) {
+                    let val = self.edit_display_text.trim();
+                    let new = if val.is_empty() { None } else { Some(val.to_string()) };
+                    match sel {
+                        SelectedControl::Key(idx) => {
+                            if let Some(k) = p.keys.get_mut(idx) {
+                                k.appearance.text = new;
+                            }
+                        }
+                        SelectedControl::Dial(idx) => {
+                            if let Some(d) = p.dials.get_mut(idx) {
+                                d.appearance.text = new;
+                            }
+                        }
+                        SelectedControl::TouchStrip => {
+                            p.touch_strip.appearance.text = new;
+                        }
                     }
                 }
                 Command::none()
@@ -406,6 +648,7 @@ impl Application for App {
             },
             Message::OpenMarketplace => {
                 self.active_view = ActiveView::Marketplace;
+                self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
                 let Some(idx) = self.marketplace.selected_source_idx else {
                     self.marketplace.loading = false;
                     self.marketplace.error = Some("No marketplace selected.".to_string());
@@ -420,7 +663,7 @@ impl Application for App {
                 if url.trim().is_empty() {
                     self.marketplace.loading = false;
                     self.marketplace.error =
-                        Some("Marketplace URL is empty. Add/edit a marketplace first.".to_string());
+                        Some("Marketplace URL is not configured.".to_string());
                     return Command::none();
                 }
                 self.marketplace.loading = true;
@@ -446,7 +689,7 @@ impl Application for App {
                 if url.trim().is_empty() {
                     self.marketplace.loading = false;
                     self.marketplace.error =
-                        Some("Marketplace URL is empty. Add/edit a marketplace first.".to_string());
+                        Some("Marketplace URL is not configured.".to_string());
                     return Command::none();
                 }
                 self.marketplace.loading = true;
@@ -458,17 +701,9 @@ impl Application for App {
                 self.marketplace.selected_source_idx = idx;
                 Command::perform(async { () }, |_| Message::MarketplaceRefresh)
             }
-            Message::MarketplaceIndexUrlChanged(url) => {
-                // Allow editing the current source URL in-place.
-                if let Some(idx) = self.marketplace.selected_source_idx {
-                    if let Some(sel) = self.marketplace.sources.get_mut(idx) {
-                        sel.index_url = url;
-                    }
-                }
-                Command::none()
-            }
             Message::MarketplaceSearchChanged(q) => {
                 self.marketplace.query = q;
+                self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
                 Command::none()
             }
             Message::MarketplaceLoaded(res) => {
@@ -477,6 +712,43 @@ impl Application for App {
                     Ok(list) => {
                         self.marketplace.plugins = list;
                         self.marketplace.error = None;
+                        self.marketplace.visible = MARKETPLACE_PAGE_SIZE;
+                        // Kick off icon fetches for the current marketplace source.
+                        if let Some(src) = self.current_marketplace_source().cloned() {
+                            let mut cmds = vec![];
+                            let q = self.marketplace.query.trim().to_ascii_lowercase();
+                            for p in self
+                                .marketplace
+                                .plugins
+                                .iter()
+                                .filter(|p| {
+                                    if q.is_empty() {
+                                        true
+                                    } else {
+                                        p.name.to_ascii_lowercase().contains(&q)
+                                            || p.id.to_ascii_lowercase().contains(&q)
+                                            || p.description.to_ascii_lowercase().contains(&q)
+                                    }
+                                })
+                                .take(self.marketplace.visible)
+                            {
+                                let Some(icon_url) = marketplace_icon_url(&src, p) else {
+                                    continue;
+                                };
+                                let key = format!("{}|{}", src.index_url, p.id);
+                                if self.marketplace.icon_cache.contains_key(&key) {
+                                    continue;
+                                }
+                                cmds.push(Command::perform(
+                                    fetch_icon_async(icon_url),
+                                    {
+                                        let key = key.clone();
+                                        move |bytes| Message::MarketplaceIconLoaded { key, bytes }
+                                    },
+                                ));
+                            }
+                            return Command::batch(cmds);
+                        }
                     }
                     Err(e) => {
                         self.marketplace.plugins.clear();
@@ -485,58 +757,282 @@ impl Application for App {
                 }
                 Command::none()
             }
-            Message::MarketplaceNewSourceNameChanged(v) => {
-                self.marketplace.new_source_name = v;
-                Command::none()
-            }
-            Message::MarketplaceNewSourceUrlChanged(v) => {
-                self.marketplace.new_source_url = v;
-                Command::none()
-            }
-            Message::MarketplaceAddSource => {
-                let name = self.marketplace.new_source_name.trim().to_string();
-                let url = self.marketplace.new_source_url.trim().to_string();
-                if name.is_empty() || url.is_empty() {
-                    return Command::none();
-                }
+            Message::MarketplaceLoadMore => {
+                let prev = self.marketplace.visible;
+                self.marketplace.visible = self
+                    .marketplace
+                    .visible
+                    .saturating_add(MARKETPLACE_PAGE_SIZE);
 
-                let src = MarketplaceSource {
-                    name,
-                    index_url: url,
+                let Some(src) = self.current_marketplace_source().cloned() else {
+                    return Command::none();
                 };
 
-                if !self.marketplace.sources.contains(&src) {
-                    self.marketplace.sources.push(src.clone());
-                }
-                self.marketplace.selected_source_idx = self
+                // Fetch icons only for newly visible entries.
+                let q = self.marketplace.query.trim().to_ascii_lowercase();
+                let mut cmds = vec![];
+                for (i, p) in self
                     .marketplace
-                    .sources
+                    .plugins
                     .iter()
-                    .position(|s| s == &src);
-                self.marketplace.new_source_name.clear();
-                self.marketplace.new_source_url.clear();
+                    .filter(|p| {
+                        if q.is_empty() {
+                            true
+                        } else {
+                            p.name.to_ascii_lowercase().contains(&q)
+                                || p.id.to_ascii_lowercase().contains(&q)
+                                || p.description.to_ascii_lowercase().contains(&q)
+                        }
+                    })
+                    .enumerate()
+                {
+                    if i < prev {
+                        continue;
+                    }
+                    if i >= self.marketplace.visible {
+                        break;
+                    }
+                    let Some(icon_url) = marketplace_icon_url(&src, p) else {
+                        continue;
+                    };
+                    let key = format!("{}|{}", src.index_url, p.id);
+                    if self.marketplace.icon_cache.contains_key(&key) {
+                        continue;
+                    }
+                    cmds.push(Command::perform(
+                        fetch_icon_async(icon_url),
+                        {
+                            let key = key.clone();
+                            move |bytes| Message::MarketplaceIconLoaded { key, bytes }
+                        },
+                    ));
+                }
+                Command::batch(cmds)
+            }
+            Message::MarketplaceIconLoaded { key, bytes } => {
+                if let Ok(bytes) = bytes {
+                    self.marketplace
+                        .icon_cache
+                        .insert(key, iced::widget::image::Handle::from_memory(bytes));
+                }
+                Command::none()
+            }
+            Message::ActionSeqContinue(seq_id) => self.run_next_action_step(seq_id),
+            Message::ActionSeqStepDone { seq_id, res } => {
+                if let Err(e) = res {
+                    tracing::error!(seq_id, error = %e, "action step failed");
+                    self.error = Some(e);
+                } else {
+                    tracing::debug!(seq_id, "action step completed");
+                }
+                self.run_next_action_step(seq_id)
+            }
+            Message::ActionModePicked(mode) => {
+                self.set_selected_action_mode(mode);
+                Command::none()
+            }
+            Message::BuiltinKindPicked(kind) => {
+                self.set_selected_builtin_kind(kind);
+                Command::none()
+            }
+            Message::BuiltinIssueCommandChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::IssueCommand { command, .. } = b {
+                        *command = v;
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinIssueCwdChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::IssueCommand { cwd, .. } = b {
+                        let s = v.trim().to_string();
+                        *cwd = if s.is_empty() { None } else { Some(s) };
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinIssueTimeoutChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::IssueCommand { timeout_ms, .. } = b {
+                        let s = v.trim();
+                        *timeout_ms = if s.is_empty() {
+                            None
+                        } else {
+                            s.parse::<u64>().ok()
+                        };
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinKeyboardTextChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::KeyboardInput { text, .. } = b {
+                        let s = v;
+                        *text = if s.trim().is_empty() { None } else { Some(s) };
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinKeyboardKeysChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::KeyboardInput { keys, .. } = b {
+                        *keys = v
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>();
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinPlaySoundPathChanged(v) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::PlaySound { path } = b {
+                        *path = v;
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinSwitchProfilePicked(choice) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::SwitchProfile { mode } = b {
+                        *mode = match choice {
+                            SwitchProfileChoice::Next => actions::SwitchProfileMode::Next,
+                            SwitchProfileChoice::Prev => actions::SwitchProfileMode::Prev,
+                            SwitchProfileChoice::To(id) => {
+                                actions::SwitchProfileMode::To { profile_id: id.0 }
+                            }
+                        };
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinBrightnessModePicked(m) => {
+                // Keep existing value if possible.
+                let current = self.selected_builtin_brightness_value().unwrap_or(30);
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::DeviceBrightness { mode } = b {
+                        *mode = match m {
+                            BrightnessModeChoice::Set => actions::BrightnessMode::Set {
+                                percent: current as u8,
+                            },
+                            BrightnessModeChoice::Increase => actions::BrightnessMode::Increase {
+                                delta: current as u8,
+                            },
+                            BrightnessModeChoice::Decrease => actions::BrightnessMode::Decrease {
+                                delta: current as u8,
+                            },
+                        };
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinBrightnessValueChanged(v) => {
+                let v = v.clamp(0, 100) as u8;
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::DeviceBrightness { mode } = b {
+                        match mode {
+                            actions::BrightnessMode::Set { percent } => *percent = v,
+                            actions::BrightnessMode::Increase { delta } => *delta = v,
+                            actions::BrightnessMode::Decrease { delta } => *delta = v,
+                        }
+                    }
+                });
+                Command::none()
+            }
+            Message::BuiltinMonitorKindPicked(k) => {
+                self.update_selected_builtin(|b| {
+                    if let BuiltinAction::SystemMonitoring { kind, .. } = b {
+                        *kind = match k {
+                            MonitorKindChoice::Cpu => actions::MonitorKind::Cpu,
+                            MonitorKindChoice::Memory => actions::MonitorKind::Memory,
+                            MonitorKindChoice::LoadAverage => actions::MonitorKind::LoadAverage,
+                        }
+                    }
+                });
+                Command::none()
+            }
+            Message::MacroAddStep => {
+                self.macro_add_step();
+                Command::none()
+            }
+            Message::MacroRemoveStep(i) => {
+                self.macro_remove_step(i);
+                Command::none()
+            }
+            Message::MacroMoveStepUp(i) => {
+                self.macro_move_step(i, true);
+                Command::none()
+            }
+            Message::MacroMoveStepDown(i) => {
+                self.macro_move_step(i, false);
+                Command::none()
+            }
+            Message::MacroStepKindPicked { idx, kind } => {
+                self.macro_set_step_kind(idx, kind);
+                Command::none()
+            }
+            Message::MacroStepDelayChanged { idx, value } => {
+                self.macro_set_step_delay(idx, value);
+                Command::none()
+            }
+            Message::MacroStepPluginPicked { idx, choice } => {
+                self.macro_set_step_plugin(idx, choice);
+                Command::none()
+            }
+            Message::MacroStepCommandChanged { idx, value } => {
+                self.macro_set_step_command(idx, value);
+                Command::none()
+            }
+            Message::StartDragAction(a) => {
+                self.drag.dragging = Some(a);
+                self.drag.over_key = None;
+                Command::none()
+            }
+            Message::CancelDragAction => {
+                self.drag.dragging = None;
+                self.drag.over_key = None;
+                Command::none()
+            }
+            Message::DragOverKey(idx) => {
+                self.drag.over_key = idx;
+                Command::none()
+            }
+            Message::DropOnKey(idx) => {
+                let Some(dragged) = self.drag.dragging.clone() else {
+                    return Command::none();
+                };
+                self.drag.dragging = None;
+                self.drag.over_key = None;
 
-                Command::perform(async { () }, |_| Message::MarketplaceRefresh)
+                self.selected_control = Some(SelectedControl::Key(idx));
+                self.selected_binding_target = BindingTarget::KeyPress;
+                self.assign_dragged_action_to_key(idx, dragged);
+                Command::none()
             }
             Message::ActionSelected(choice) => {
-                let Some(idx) = self.selected_key else {
-                    self.error =
-                        Some("Select a key in the preview before assigning an action.".to_string());
+                if self.selected_control.is_none() {
+                    self.error = Some(
+                        "Select a key/dial/touch strip in the preview before assigning an action."
+                            .to_string(),
+                    );
                     return Command::none();
                 };
-                let Some(p) = &mut self.profile else {
+                let Some(_p) = &mut self.profile else {
                     self.error = Some("No profile loaded.".to_string());
                     return Command::none();
                 };
 
-                if let Some(k) = p.keys.get_mut(idx) {
-                    let settings = default_settings_for_action(&self.plugins, &choice);
-                    k.action = Some(ActionBinding {
-                        plugin_id: choice.plugin_id.clone(),
-                        action_id: choice.action_id.clone(),
-                        settings,
-                    });
-                }
+                let Some(slot) = self.selected_binding_mut() else {
+                    self.error = Some("Invalid binding target for selected control.".to_string());
+                    return Command::none();
+                };
+                let settings = default_settings_for_action(&self.plugins, &choice);
+                *slot = Some(ActionBinding::Plugin(PluginActionBinding {
+                    plugin_id: choice.plugin_id.clone(),
+                    action_id: choice.action_id.clone(),
+                    settings,
+                }));
                 Command::none()
             }
             Message::ActionSearchChanged(s) => {
@@ -544,21 +1040,11 @@ impl Application for App {
                 Command::none()
             }
             Message::SettingStringChanged { key, value } => {
-                set_current_key_setting(
-                    self.profile.as_mut(),
-                    self.selected_key,
-                    key,
-                    serde_json::Value::String(value),
-                );
+                self.set_selected_plugin_setting(key, serde_json::Value::String(value));
                 Command::none()
             }
             Message::SettingBoolChanged { key, value } => {
-                set_current_key_setting(
-                    self.profile.as_mut(),
-                    self.selected_key,
-                    key,
-                    serde_json::Value::Bool(value),
-                );
+                self.set_selected_plugin_setting(key, serde_json::Value::Bool(value));
                 Command::none()
             }
             Message::SettingNumberChanged { key, value } => {
@@ -569,53 +1055,91 @@ impl Application for App {
                 let v = num
                     .map(serde_json::Value::Number)
                     .unwrap_or(serde_json::Value::Null);
-                set_current_key_setting(self.profile.as_mut(), self.selected_key, key, v);
-                Command::none()
-            }
-            Message::ActionInvoked(res) => {
-                if let Err(e) = res {
-                    self.error = Some(e);
-                }
+                self.set_selected_plugin_setting(key, v);
                 Command::none()
             }
             Message::Tick => {
                 let mut cmds: Vec<Command<Message>> = vec![];
+                self.refresh_system_snapshot();
+                let mut pending_actions: Vec<(InvocationControl, InvocationEvent, ActionBinding)> =
+                    vec![];
                 if let Some(c) = &mut self.connected {
                     while let Ok(ev) = c.events.try_recv() {
                         match ev {
-                            DeviceEvent::KeyDown { key } => {
-                                if let Some(slot) = c.pressed.get_mut(key as usize) {
-                                    *slot = true;
-                                }
+                            DeviceEvent::Control(ev) => match (ev.control, ev.kind) {
+                                (ControlId::Key(key), ControlEventKind::Down) => {
+                                    if let Some(slot) = c.pressed.get_mut(key as usize) {
+                                        *slot = true;
+                                    }
 
-                                // Dispatch bound action on key-down.
-                                if let Some(p) = &self.profile {
-                                    if let Some(kcfg) = p.keys.get(key as usize) {
-                                        if let Some(binding) = &kcfg.action {
-                                            if let Some(plugin) = self
-                                                .plugins
-                                                .iter()
-                                                .find(|pl| pl.manifest.id == binding.plugin_id)
-                                                .cloned()
-                                            {
-                                                let action_id = binding.action_id.clone();
-                                                let settings = binding.settings.clone();
-                                                cmds.push(Command::perform(
-                                                    invoke_action_async(
-                                                        plugin, action_id, key, settings,
-                                                    ),
-                                                    Message::ActionInvoked,
+                                    // Dispatch bound action on key-down (plugin or builtin).
+                                    if let Some(p) = &self.profile {
+                                        if let Some(kcfg) = p.keys.get(key as usize) {
+                                            if let Some(binding) = &kcfg.action {
+                                                pending_actions.push((
+                                                    InvocationControl::Key { index: key },
+                                                    InvocationEvent::KeyDown,
+                                                    binding.clone(),
                                                 ));
                                             }
                                         }
                                     }
                                 }
-                            }
-                            DeviceEvent::KeyUp { key } => {
-                                if let Some(slot) = c.pressed.get_mut(key as usize) {
-                                    *slot = false;
+                                (ControlId::Key(key), ControlEventKind::Up) => {
+                                    if let Some(slot) = c.pressed.get_mut(key as usize) {
+                                        *slot = false;
+                                    }
                                 }
-                            }
+                                (ControlId::Dial(dial), ControlEventKind::Down) => {
+                                    if let Some(p) = &self.profile {
+                                        if let Some(d) = p.dials.get(dial as usize) {
+                                            if let Some(binding) = &d.press {
+                                                pending_actions.push((
+                                                    InvocationControl::Dial { index: dial },
+                                                    InvocationEvent::DialDown,
+                                                    binding.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                (ControlId::Dial(dial), ControlEventKind::Rotate { delta }) => {
+                                    if let Some(p) = &self.profile {
+                                        if let Some(d) = p.dials.get(dial as usize) {
+                                            if let Some(binding) = &d.rotate {
+                                                pending_actions.push((
+                                                    InvocationControl::Dial { index: dial },
+                                                    InvocationEvent::DialRotate { delta },
+                                                    binding.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                (ControlId::TouchStrip, ControlEventKind::Tap { x }) => {
+                                    if let Some(p) = &self.profile {
+                                        if let Some(binding) = &p.touch_strip.tap {
+                                            pending_actions.push((
+                                                InvocationControl::TouchStrip,
+                                                InvocationEvent::TouchTap { x },
+                                                binding.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                (ControlId::TouchStrip, ControlEventKind::Drag { delta_x }) => {
+                                    if let Some(p) = &self.profile {
+                                        if let Some(binding) = &p.touch_strip.drag {
+                                            pending_actions.push((
+                                                InvocationControl::TouchStrip,
+                                                InvocationEvent::TouchDrag { delta_x },
+                                                binding.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
                             DeviceEvent::Disconnected => {
                                 self.error = Some("Device disconnected".to_string());
                                 self.connected = None;
@@ -623,6 +1147,10 @@ impl Application for App {
                             }
                         }
                     }
+                }
+
+                for (control, event, binding) in pending_actions {
+                    cmds.push(self.start_action_sequence(control, event, &binding));
                 }
                 Command::batch(cmds)
             }
@@ -704,8 +1232,12 @@ enum Message {
     ProfileCreated(Result<Profile, String>),
     ProfilePicked(ProfileChoice),
     ProfileLoaded(Result<Profile, String>),
-    SelectKey(usize),
+    SelectControl(SelectedControl),
     LabelChanged(String),
+    BindingTargetPicked(BindingTarget),
+    BgRgbChanged(String),
+    IconPathChanged(String),
+    DisplayTextChanged(String),
     SaveProfile,
     ProfileSaved(Result<(), String>),
     RefreshPlugins,
@@ -717,18 +1249,41 @@ enum Message {
     CloseMarketplace,
     MarketplaceRefresh,
     MarketplaceSourcePicked(MarketplaceSource),
-    MarketplaceIndexUrlChanged(String),
     MarketplaceSearchChanged(String),
     MarketplaceLoaded(Result<Vec<MarketplacePlugin>, String>),
-    MarketplaceNewSourceNameChanged(String),
-    MarketplaceNewSourceUrlChanged(String),
-    MarketplaceAddSource,
+    MarketplaceIconLoaded { key: String, bytes: Result<Vec<u8>, String> },
+    MarketplaceLoadMore,
+    ActionSeqContinue(u64),
+    ActionSeqStepDone { seq_id: u64, res: Result<(), String> },
+    ActionModePicked(ActionModeChoice),
+    BuiltinKindPicked(BuiltinKindChoice),
+    BuiltinIssueCommandChanged(String),
+    BuiltinIssueCwdChanged(String),
+    BuiltinIssueTimeoutChanged(String),
+    BuiltinKeyboardTextChanged(String),
+    BuiltinKeyboardKeysChanged(String),
+    BuiltinPlaySoundPathChanged(String),
+    BuiltinSwitchProfilePicked(SwitchProfileChoice),
+    BuiltinBrightnessModePicked(BrightnessModeChoice),
+    BuiltinBrightnessValueChanged(i32),
+    BuiltinMonitorKindPicked(MonitorKindChoice),
+    MacroAddStep,
+    MacroRemoveStep(usize),
+    MacroMoveStepUp(usize),
+    MacroMoveStepDown(usize),
+    MacroStepKindPicked { idx: usize, kind: MacroStepKindChoice },
+    MacroStepDelayChanged { idx: usize, value: String },
+    MacroStepPluginPicked { idx: usize, choice: ActionChoice },
+    MacroStepCommandChanged { idx: usize, value: String },
+    StartDragAction(DraggedAction),
+    CancelDragAction,
+    DragOverKey(Option<usize>),
+    DropOnKey(usize),
     ActionSelected(ActionChoice),
     ActionSearchChanged(String),
     SettingStringChanged { key: String, value: String },
     SettingBoolChanged { key: String, value: bool },
     SettingNumberChanged { key: String, value: String },
-    ActionInvoked(Result<(), String>),
     Tick,
     BrightnessChanged(i32),
     BrightnessApplied(Result<(), String>),
@@ -800,7 +1355,325 @@ impl fmt::Display for ActionChoice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ActionModeChoice {
+    None,
+    Plugin,
+    Builtin,
+}
+
+impl fmt::Display for ActionModeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActionModeChoice::None => write!(f, "None"),
+            ActionModeChoice::Plugin => write!(f, "Plugin"),
+            ActionModeChoice::Builtin => write!(f, "Builtin"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BuiltinKindChoice {
+    Macro,
+    IssueCommand,
+    KeyboardInput,
+    PlaySound,
+    SwitchProfile,
+    DeviceBrightness,
+    SystemMonitoring,
+}
+
+impl fmt::Display for BuiltinKindChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuiltinKindChoice::Macro => write!(f, "Macro"),
+            BuiltinKindChoice::IssueCommand => write!(f, "Issue Command"),
+            BuiltinKindChoice::KeyboardInput => write!(f, "Keyboard Input"),
+            BuiltinKindChoice::PlaySound => write!(f, "Play Sound"),
+            BuiltinKindChoice::SwitchProfile => write!(f, "Switch Profile"),
+            BuiltinKindChoice::DeviceBrightness => write!(f, "Device Brightness"),
+            BuiltinKindChoice::SystemMonitoring => write!(f, "System Monitoring"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SwitchProfileChoice {
+    Next,
+    Prev,
+    // Specific profile chosen from list.
+    To(ProfileId),
+}
+
+impl fmt::Display for SwitchProfileChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SwitchProfileChoice::Next => write!(f, "Next profile"),
+            SwitchProfileChoice::Prev => write!(f, "Previous profile"),
+            SwitchProfileChoice::To(id) => write!(f, "Profile {}", id.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BrightnessModeChoice {
+    Set,
+    Increase,
+    Decrease,
+}
+
+impl fmt::Display for BrightnessModeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BrightnessModeChoice::Set => write!(f, "Set"),
+            BrightnessModeChoice::Increase => write!(f, "Increase"),
+            BrightnessModeChoice::Decrease => write!(f, "Decrease"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MonitorKindChoice {
+    Cpu,
+    Memory,
+    LoadAverage,
+}
+
+impl fmt::Display for MonitorKindChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MonitorKindChoice::Cpu => write!(f, "CPU"),
+            MonitorKindChoice::Memory => write!(f, "Memory"),
+            MonitorKindChoice::LoadAverage => write!(f, "Load average"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MacroStepKindChoice {
+    PluginAction,
+    IssueCommand,
+}
+
+impl fmt::Display for MacroStepKindChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MacroStepKindChoice::PluginAction => write!(f, "Plugin action"),
+            MacroStepKindChoice::IssueCommand => write!(f, "Issue command"),
+        }
+    }
+}
+
 impl App {
+    fn current_marketplace_source(&self) -> Option<&MarketplaceSource> {
+        self.marketplace
+            .selected_source_idx
+            .and_then(|i| self.marketplace.sources.get(i))
+    }
+
+    fn start_action_sequence(
+        &mut self,
+        control: InvocationControl,
+        event: InvocationEvent,
+        binding: &ActionBinding,
+    ) -> Command<Message> {
+        let steps = match actions::expand(binding) {
+            Ok(steps) => steps,
+            Err(e) => {
+                tracing::error!(?control, ?event, error = %e, "failed to expand action binding");
+                return Command::perform(async { () }, move |_| {
+                    Message::ActionSeqStepDone {
+                        seq_id: 0,
+                        res: Err(e.to_string()),
+                    }
+                })
+            }
+        };
+
+        let seq_id = self.next_action_seq_id;
+        self.next_action_seq_id = self.next_action_seq_id.saturating_add(1);
+
+        self.action_sequences.insert(
+            seq_id,
+            ActionSequence {
+                origin_control: control.clone(),
+                origin_event: event.clone(),
+                steps: VecDeque::from(steps),
+            },
+        );
+
+        tracing::info!(?control, ?event, seq_id, "starting action sequence");
+        Command::perform(async { () }, move |_| Message::ActionSeqContinue(seq_id))
+    }
+
+    fn run_next_action_step(&mut self, seq_id: u64) -> Command<Message> {
+        let Some((origin_control, origin_event)) = self
+            .action_sequences
+            .get(&seq_id)
+            .map(|s| (s.origin_control.clone(), s.origin_event.clone()))
+        else {
+            return Command::none();
+        };
+
+        let step = {
+            let Some(seq) = self.action_sequences.get_mut(&seq_id) else {
+                return Command::none();
+            };
+            seq.steps.pop_front()
+        };
+
+        let Some(step) = step else {
+            self.action_sequences.remove(&seq_id);
+            tracing::debug!(seq_id, "action sequence finished");
+            return Command::none();
+        };
+
+        match step {
+            ActionStep::DelayMs(ms) => Command::perform(sleep_ms_async(ms), move |_| {
+                tracing::debug!(seq_id, delay_ms = ms, "action sequence delay");
+                Message::ActionSeqContinue(seq_id)
+            }),
+            ActionStep::Plugin(p) => {
+                tracing::info!(
+                    seq_id,
+                    ?origin_control,
+                    ?origin_event,
+                    plugin_id = %p.plugin_id,
+                    action_id = %p.action_id,
+                    "executing plugin action"
+                );
+                let Some(plugin) = self.plugins.iter().find(|pl| pl.manifest.id == p.plugin_id).cloned() else {
+                    return Command::perform(async { () }, move |_| Message::ActionSeqStepDone {
+                        seq_id,
+                        res: Err(format!("[Action] Plugin not installed: {}", p.plugin_id)),
+                    });
+                };
+                let action_id = p.action_id.clone();
+                let settings = p.settings.clone();
+                Command::perform(
+                    invoke_action_async(
+                        plugin,
+                        action_id,
+                        origin_control.clone(),
+                        origin_event.clone(),
+                        settings,
+                    ),
+                    move |res| Message::ActionSeqStepDone { seq_id, res },
+                )
+            }
+            ActionStep::Builtin(b) => {
+                tracing::info!(seq_id, ?origin_control, builtin = ?b, "executing builtin action");
+                self.execute_builtin_step(seq_id, origin_control.clone(), b)
+            }
+        }
+    }
+
+    fn execute_builtin_step(
+        &mut self,
+        seq_id: u64,
+        origin_control: InvocationControl,
+        b: actions::BuiltinAction,
+    ) -> Command<Message> {
+        match b {
+            BuiltinAction::Macro { .. } => {
+                // Macro should have been expanded away by `actions::expand`.
+                Command::perform(async { () }, move |_| Message::ActionSeqStepDone {
+                    seq_id,
+                    res: Err("Internal: macro was not expanded".to_string()),
+                })
+            }
+            BuiltinAction::IssueCommand { command, cwd, timeout_ms } => {
+                tracing::info!(seq_id, ?origin_control, %command, "builtin: issue_command");
+                Command::perform(issue_command_async(command, cwd, timeout_ms), move |res| {
+                    Message::ActionSeqStepDone { seq_id, res }
+                })
+            }
+            BuiltinAction::KeyboardInput { text, keys } => {
+                tracing::info!(
+                    seq_id,
+                    ?origin_control,
+                    has_text = text.is_some(),
+                    keys_len = keys.len(),
+                    "builtin: keyboard_input"
+                );
+                Command::perform(keyboard_input_async(text, keys), move |res| {
+                    Message::ActionSeqStepDone { seq_id, res }
+                })
+            }
+            BuiltinAction::PlaySound { path } => {
+                tracing::info!(seq_id, ?origin_control, %path, "builtin: play_sound");
+                Command::perform(play_sound_async(path), move |res| {
+                Message::ActionSeqStepDone { seq_id, res }
+                })
+            }
+            BuiltinAction::SwitchProfile { mode } => {
+                tracing::info!(seq_id, ?origin_control, mode = ?mode, "builtin: switch_profile");
+                let target = match mode {
+                    actions::SwitchProfileMode::To { profile_id } => Some(ProfileId(profile_id)),
+                    actions::SwitchProfileMode::Next => {
+                        let current = self.selected_profile;
+                        self.profiles
+                            .iter()
+                            .position(|p| Some(p.id) == current)
+                            .map(|i| self.profiles[(i + 1) % self.profiles.len()].id)
+                    }
+                    actions::SwitchProfileMode::Prev => {
+                        let current = self.selected_profile;
+                        self.profiles.iter().position(|p| Some(p.id) == current).map(|i| {
+                            let n = self.profiles.len();
+                            self.profiles[(i + n - 1) % n].id
+                        })
+                    }
+                };
+
+                let Some(id) = target else {
+                    return Command::perform(async { () }, move |_| Message::ActionSeqStepDone {
+                        seq_id,
+                        res: Err("[Action] No profiles available to switch.".to_string()),
+                    });
+                };
+
+                self.selected_profile = Some(id);
+                // Load profile and continue sequence.
+                Command::batch([
+                    Command::perform(load_profile_async(id), Message::ProfileLoaded),
+                    Command::perform(async { () }, move |_| Message::ActionSeqContinue(seq_id)),
+                ])
+            }
+            BuiltinAction::DeviceBrightness { mode } => {
+                tracing::info!(seq_id, ?origin_control, mode = ?mode, "builtin: device_brightness");
+                let Some(c) = &mut self.connected else {
+                    return Command::perform(async { () }, move |_| Message::ActionSeqStepDone {
+                        seq_id,
+                        res: Err("[Action] Not connected to a device.".to_string()),
+                    });
+                };
+
+                let new_val = match mode {
+                    actions::BrightnessMode::Set { percent } => percent,
+                    actions::BrightnessMode::Increase { delta } => c.brightness.saturating_add(delta),
+                    actions::BrightnessMode::Decrease { delta } => c.brightness.saturating_sub(delta),
+                }
+                .clamp(0, 100);
+
+                c.brightness = new_val;
+                let controller = c.controller.clone();
+                Command::perform(set_brightness_async(controller, new_val), move |res| {
+                    Message::ActionSeqStepDone { seq_id, res }
+                })
+            }
+            BuiltinAction::SystemMonitoring { .. } => {
+                tracing::debug!(seq_id, ?origin_control, "builtin: system_monitoring (noop execute)");
+                // Live display is handled via `binding_hint` + periodic sys refresh.
+                // Executing it is a no-op for now.
+                Command::perform(async { () }, move |_| Message::ActionSeqStepDone {
+                    seq_id,
+                    res: Ok(()),
+                })
+            }
+        }
+    }
+
     fn view_topbar(&self) -> Element<'_, Message> {
         let device_selected = self
             .selected_device
@@ -931,29 +1804,72 @@ impl App {
             .on_input(Message::ActionSearchChanged);
 
         let q = self.action_search.trim().to_ascii_lowercase();
-        let actions_iter = self.actions.iter().filter(|a| {
-            if q.is_empty() {
-                true
-            } else {
-                a.label.to_ascii_lowercase().contains(&q)
-            }
-        });
+        let builtin_actions = [
+            BuiltinKindChoice::Macro,
+            BuiltinKindChoice::IssueCommand,
+            BuiltinKindChoice::KeyboardInput,
+            BuiltinKindChoice::PlaySound,
+            BuiltinKindChoice::SwitchProfile,
+            BuiltinKindChoice::DeviceBrightness,
+            BuiltinKindChoice::SystemMonitoring,
+        ];
 
         let mut list = column![].spacing(8);
         let mut any = false;
-        for a in actions_iter {
+
+        // Builtin actions (always available).
+        for k in builtin_actions {
+            let label = k.to_string();
+            if !q.is_empty() && !label.to_ascii_lowercase().contains(&q) {
+                continue;
+            }
             any = true;
             list = list.push(
-                button(text(&a.label).size(13))
-                    .style(iced::theme::Button::Secondary)
-                    .on_press(Message::ActionSelected(a.clone())),
+                mouse_area(
+                    container(
+                        row![
+                            text(label).size(13),
+                            horizontal_space(),
+                            text("drag").size(12).style(color_text_muted()),
+                        ]
+                        .align_items(Alignment::Center),
+                    )
+                    .padding(8)
+                    .style(panel()),
+                )
+                .on_press(Message::StartDragAction(DraggedAction::Builtin(k)))
+                .interaction(iced::mouse::Interaction::Grab),
+            );
+        }
+
+        // Plugin actions.
+        for a in self.actions.iter() {
+            if !q.is_empty() && !a.label.to_ascii_lowercase().contains(&q) {
+                continue;
+            }
+            any = true;
+            list = list.push(
+                mouse_area(
+                    container(
+                        row![
+                            text(&a.label).size(13),
+                            horizontal_space(),
+                            text("drag").size(12).style(color_text_muted()),
+                        ]
+                        .align_items(Alignment::Center),
+                    )
+                    .padding(8)
+                    .style(panel()),
+                )
+                .on_press(Message::StartDragAction(DraggedAction::Plugin(a.clone())))
+                .interaction(iced::mouse::Interaction::Grab),
             );
         }
 
         if !any {
             list = list.push(
                 text(if self.actions.is_empty() {
-                    "No actions available. Install a plugin first."
+                    "No actions match your search."
                 } else {
                     "No actions match your search."
                 })
@@ -962,9 +1878,24 @@ impl App {
             );
         }
 
+        let drag_hint: Element<Message> = if let Some(d) = &self.drag.dragging {
+            row![
+                text(format!("Dragging: {}", d.label())).size(12),
+                horizontal_space(),
+                button(text("Cancel"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::CancelDragAction),
+            ]
+            .align_items(Alignment::Center)
+            .into()
+        } else {
+            text("Drag an action onto a key to assign.").size(12).style(color_text_muted()).into()
+        };
+
         let content = column![
             header,
             horizontal_rule(1),
+            drag_hint,
             search,
             scrollable(list).height(Length::Fill),
         ]
@@ -989,11 +1920,7 @@ impl App {
         .align_items(Alignment::Center)
         .spacing(10);
 
-        let selected = self
-            .marketplace
-            .selected_source_idx
-            .and_then(|i| self.marketplace.sources.get(i))
-            .cloned();
+        let selected = self.current_marketplace_source().cloned();
 
         let source_picker = pick_list(
             self.marketplace.sources.clone(),
@@ -1001,33 +1928,13 @@ impl App {
             Message::MarketplaceSourcePicked,
         );
 
-        let current_url = selected
-            .as_ref()
-            .map(|s| s.index_url.as_str())
-            .unwrap_or("");
-
         let url_row = row![
             text("Marketplace").size(12).style(color_text_muted()),
             source_picker,
             horizontal_space(),
-            text("Index URL").size(12).style(color_text_muted()),
-            text_input("https://…/plugins.json", current_url)
-                .on_input(Message::MarketplaceIndexUrlChanged),
             button(text("Refresh"))
                 .style(iced::theme::Button::Secondary)
                 .on_press(Message::MarketplaceRefresh),
-        ]
-        .spacing(10)
-        .align_items(Alignment::Center);
-
-        let add_row = row![
-            text_input("New marketplace name", &self.marketplace.new_source_name)
-                .on_input(Message::MarketplaceNewSourceNameChanged),
-            text_input("New marketplace index URL", &self.marketplace.new_source_url)
-                .on_input(Message::MarketplaceNewSourceUrlChanged),
-            button(text("Add"))
-                .style(iced::theme::Button::Secondary)
-                .on_press(Message::MarketplaceAddSource),
         ]
         .spacing(10)
         .align_items(Alignment::Center);
@@ -1045,9 +1952,33 @@ impl App {
                     || p.description.to_ascii_lowercase().contains(&q)
             }
         });
+        let total_matches = list_iter.clone().count();
+        let shown = self.marketplace.visible.min(total_matches);
 
         let mut list = column![].spacing(10);
-        for p in list_iter {
+        for p in list_iter.take(self.marketplace.visible) {
+            let icon: Element<Message> = if let Some(src) = &selected {
+                let key = format!("{}|{}", src.index_url, p.id);
+                if let Some(handle) = self.marketplace.icon_cache.get(&key) {
+                    image(handle.clone())
+                        .width(Length::Fixed(32.0))
+                        .height(Length::Fixed(32.0))
+                        .into()
+                } else {
+                    container(text(""))
+                        .width(Length::Fixed(32.0))
+                        .height(Length::Fixed(32.0))
+                        .style(panel())
+                        .into()
+                }
+            } else {
+                container(text(""))
+                    .width(Length::Fixed(32.0))
+                    .height(Length::Fixed(32.0))
+                    .style(panel())
+                    .into()
+            };
+
             let mut body = column![text(&p.name).size(14)]
                 .spacing(4)
                 .push(text(p.id.clone()).size(12).style(color_text_muted()));
@@ -1065,9 +1996,19 @@ impl App {
                 button(text("Install")).style(iced::theme::Button::Secondary)
             };
 
-            list = list.push(container(row![container(body).width(Length::Fill), install_btn].spacing(12))
+            list = list.push(
+                container(
+                    row![
+                        icon,
+                        container(body).width(Length::Fill),
+                        install_btn
+                    ]
+                    .spacing(12)
+                    .align_items(Alignment::Center),
+                )
                 .padding(10)
-                .style(panel()));
+                .style(panel()),
+            );
         }
 
         let status: Element<Message> = if self.marketplace.loading {
@@ -1080,14 +2021,36 @@ impl App {
             text("").into()
         };
 
+        let footer: Element<Message> = if shown < total_matches {
+            row![
+                text(format!("Showing {shown} of {total_matches}")).style(color_text_muted()),
+                horizontal_space(),
+                button(text("Load more"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MarketplaceLoadMore),
+            ]
+            .align_items(Alignment::Center)
+            .spacing(10)
+            .into()
+        } else if total_matches > 0 {
+            row![
+                text(format!("Showing {shown} of {total_matches}")).style(color_text_muted()),
+                horizontal_space(),
+            ]
+            .align_items(Alignment::Center)
+            .into()
+        } else {
+            text("").into()
+        };
+
         let content = column![
             header,
             h_divider(),
             url_row,
-            add_row,
             search,
             status,
-            scrollable(list).height(Length::Fill)
+            scrollable(list).height(Length::Fill),
+            footer
         ]
         .spacing(10)
         .height(Length::Fill);
@@ -1102,8 +2065,12 @@ impl App {
 
     fn view_preview_panel(&self) -> Element<'_, Message> {
         let selected = self
-            .selected_key
-            .map(|k| format!("Selected: Key {k}"))
+            .selected_control
+            .map(|s| match s {
+                SelectedControl::Key(k) => format!("Selected: Key {k}"),
+                SelectedControl::Dial(d) => format!("Selected: Dial {d}"),
+                SelectedControl::TouchStrip => "Selected: Touch strip".to_string(),
+            })
             .unwrap_or_else(|| "Selected: —".to_string());
 
         let title = row![
@@ -1169,10 +2136,14 @@ impl App {
     fn view_inspector_panel(&self) -> Element<'_, Message> {
         let header = text("Inspector").size(16);
 
-        let body = match (self.connected.as_ref(), self.selected_key) {
-            (None, _) => text("Connect a device to inspect keys.").into(),
-            (Some(_), None) => text("Click a key in the preview to edit it.").into(),
-            (Some(c), Some(idx)) => self.view_key_inspector(c, idx),
+        let body = match (self.connected.as_ref(), self.selected_control) {
+            (None, _) => text("Connect a device to inspect controls.").into(),
+            (Some(_), None) => text("Click a key/dial/touch strip in the preview to edit it.").into(),
+            (Some(c), Some(sel)) => match sel {
+                SelectedControl::Key(idx) => self.view_key_inspector(c, idx),
+                SelectedControl::Dial(idx) => self.view_dial_inspector(idx),
+                SelectedControl::TouchStrip => self.view_touch_strip_inspector(),
+            },
         };
 
         container(
@@ -1213,14 +2184,11 @@ impl App {
         col = col.push(horizontal_rule(1));
 
         col = col.push(text("Action").size(14));
-        let current = self.current_action_choice(idx);
-        col = col.push(pick_list(
-            self.actions.clone(),
-            current,
-            Message::ActionSelected,
-        ));
+        col = col.push(self.view_action_editor());
 
-        col = col.push(self.view_action_settings(idx));
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Display (LCD)").size(14));
+        col = col.push(self.view_display_editor());
 
         col = col.push(horizontal_rule(1));
         col = col.push(
@@ -1231,6 +2199,710 @@ impl App {
         );
 
         col.into()
+    }
+
+    fn view_dial_inspector(&self, idx: usize) -> Element<'_, Message> {
+        let mut col = column![text(format!("Dial {idx}")).size(20)]
+            .spacing(6);
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Label").size(14));
+        col = col.push(text_input("Label", &self.edit_label).on_input(Message::LabelChanged));
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Binding target").size(14));
+        col = col.push(pick_list(
+            vec![BindingTarget::DialPress, BindingTarget::DialRotate],
+            Some(self.selected_binding_target),
+            Message::BindingTargetPicked,
+        ));
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Action").size(14));
+        col = col.push(self.view_action_editor());
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Display (LCD)").size(14));
+        col = col.push(self.view_display_editor());
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(
+            row![button(text("Save"))
+                .on_press(Message::SaveProfile)
+                .style(iced::theme::Button::Primary),]
+            .spacing(8),
+        );
+
+        col.into()
+    }
+
+    fn view_touch_strip_inspector(&self) -> Element<'_, Message> {
+        let mut col = column![text("Touch strip").size(20)].spacing(6);
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Binding target").size(14));
+        col = col.push(pick_list(
+            vec![BindingTarget::TouchTap, BindingTarget::TouchDrag],
+            Some(self.selected_binding_target),
+            Message::BindingTargetPicked,
+        ));
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Action").size(14));
+        col = col.push(self.view_action_editor());
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(text("Display (LCD)").size(14));
+        col = col.push(self.view_display_editor());
+
+        col = col.push(horizontal_rule(1));
+        col = col.push(
+            row![button(text("Save"))
+                .on_press(Message::SaveProfile)
+                .style(iced::theme::Button::Primary),]
+            .spacing(8),
+        );
+
+        col.into()
+    }
+
+    fn selected_binding(&self) -> Option<&Option<ActionBinding>> {
+        let p = self.profile.as_ref()?;
+        let sel = self.selected_control?;
+        match (sel, self.selected_binding_target) {
+            (SelectedControl::Key(idx), BindingTarget::KeyPress) => Some(&p.keys.get(idx)?.action),
+            (SelectedControl::Dial(idx), BindingTarget::DialPress) => Some(&p.dials.get(idx)?.press),
+            (SelectedControl::Dial(idx), BindingTarget::DialRotate) => Some(&p.dials.get(idx)?.rotate),
+            (SelectedControl::TouchStrip, BindingTarget::TouchTap) => Some(&p.touch_strip.tap),
+            (SelectedControl::TouchStrip, BindingTarget::TouchDrag) => Some(&p.touch_strip.drag),
+            _ => None,
+        }
+    }
+
+    fn selected_binding_mut(&mut self) -> Option<&mut Option<ActionBinding>> {
+        let p = self.profile.as_mut()?;
+        let sel = self.selected_control?;
+        match (sel, self.selected_binding_target) {
+            (SelectedControl::Key(idx), BindingTarget::KeyPress) => Some(&mut p.keys.get_mut(idx)?.action),
+            (SelectedControl::Dial(idx), BindingTarget::DialPress) => Some(&mut p.dials.get_mut(idx)?.press),
+            (SelectedControl::Dial(idx), BindingTarget::DialRotate) => Some(&mut p.dials.get_mut(idx)?.rotate),
+            (SelectedControl::TouchStrip, BindingTarget::TouchTap) => Some(&mut p.touch_strip.tap),
+            (SelectedControl::TouchStrip, BindingTarget::TouchDrag) => Some(&mut p.touch_strip.drag),
+            _ => None,
+        }
+    }
+
+    fn set_selected_plugin_setting(&mut self, key: String, value: serde_json::Value) {
+        let Some(slot) = self.selected_binding_mut() else {
+            return;
+        };
+        let Some(ActionBinding::Plugin(binding)) = slot.as_mut() else {
+            return;
+        };
+
+        if let Some(obj) = binding.settings.as_object_mut() {
+            obj.insert(key, value);
+            return;
+        }
+
+        let mut map = serde_json::Map::new();
+        map.insert(key, value);
+        binding.settings = serde_json::Value::Object(map);
+    }
+
+    fn view_display_editor(&self) -> Element<'_, Message> {
+        column![
+            text("Background RGB (r,g,b or empty)").size(12).style(color_text_muted()),
+            text_input("", &self.edit_bg_rgb).on_input(Message::BgRgbChanged),
+            text("Icon path (optional)").size(12).style(color_text_muted()),
+            text_input("/path/to/icon.png", &self.edit_icon_path).on_input(Message::IconPathChanged),
+            text("Text (optional)").size(12).style(color_text_muted()),
+            text_input("", &self.edit_display_text).on_input(Message::DisplayTextChanged),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn view_action_editor(&self) -> Element<'_, Message> {
+        let Some(binding) = self.selected_binding() else {
+            return text("Select a control to edit its action.").into();
+        };
+
+        let mode = match binding {
+            None => ActionModeChoice::None,
+            Some(ActionBinding::Plugin(_)) => ActionModeChoice::Plugin,
+            Some(ActionBinding::Builtin(_)) => ActionModeChoice::Builtin,
+        };
+
+        let mode_picker = pick_list(
+            vec![
+                ActionModeChoice::None,
+                ActionModeChoice::Plugin,
+                ActionModeChoice::Builtin,
+            ],
+            Some(mode),
+            Message::ActionModePicked,
+        );
+
+        let mut col = column![row![
+            text("Mode").size(12).style(color_text_muted()),
+            mode_picker
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center)]
+        .spacing(8);
+
+        match binding {
+            None => {
+                col = col.push(text("No action bound.").style(color_text_muted()));
+            }
+            Some(ActionBinding::Plugin(_)) => {
+                let current = self.current_action_choice();
+                col = col.push(pick_list(
+                    self.actions.clone(),
+                    current,
+                    Message::ActionSelected,
+                ));
+                col = col.push(self.view_action_settings());
+            }
+            Some(ActionBinding::Builtin(b)) => {
+                let current_kind = match b {
+                    BuiltinAction::Macro { .. } => BuiltinKindChoice::Macro,
+                    BuiltinAction::IssueCommand { .. } => BuiltinKindChoice::IssueCommand,
+                    BuiltinAction::KeyboardInput { .. } => BuiltinKindChoice::KeyboardInput,
+                    BuiltinAction::PlaySound { .. } => BuiltinKindChoice::PlaySound,
+                    BuiltinAction::SwitchProfile { .. } => BuiltinKindChoice::SwitchProfile,
+                    BuiltinAction::DeviceBrightness { .. } => BuiltinKindChoice::DeviceBrightness,
+                    BuiltinAction::SystemMonitoring { .. } => BuiltinKindChoice::SystemMonitoring,
+                };
+
+                col = col.push(pick_list(
+                    vec![
+                        BuiltinKindChoice::Macro,
+                        BuiltinKindChoice::IssueCommand,
+                        BuiltinKindChoice::KeyboardInput,
+                        BuiltinKindChoice::PlaySound,
+                        BuiltinKindChoice::SwitchProfile,
+                        BuiltinKindChoice::DeviceBrightness,
+                        BuiltinKindChoice::SystemMonitoring,
+                    ],
+                    Some(current_kind),
+                    Message::BuiltinKindPicked,
+                ));
+
+                col = col.push(self.view_builtin_settings(b));
+            }
+        }
+
+        col.into()
+    }
+
+    fn view_builtin_settings(&self, b: &BuiltinAction) -> Element<'_, Message> {
+        match b {
+            BuiltinAction::Macro { steps } => self.view_macro_editor(steps),
+            BuiltinAction::IssueCommand {
+                command,
+                cwd,
+                timeout_ms,
+            } => {
+                let timeout = timeout_ms.map(|v| v.to_string()).unwrap_or_default();
+                column![
+                    text("Command").size(12).style(color_text_muted()),
+                    text_input("bash command…", command).on_input(Message::BuiltinIssueCommandChanged),
+                    text("Working dir (optional)").size(12).style(color_text_muted()),
+                    text_input("", cwd.as_deref().unwrap_or("")).on_input(Message::BuiltinIssueCwdChanged),
+                    text("Timeout ms (optional)").size(12).style(color_text_muted()),
+                    text_input("", &timeout).on_input(Message::BuiltinIssueTimeoutChanged),
+                    text("Runs via `bash -lc` (Linux MVP).").size(12).style(color_text_muted()),
+                ]
+                .spacing(6)
+                .into()
+            }
+            BuiltinAction::KeyboardInput { text: input_text, keys } => {
+                let keys_s = keys.join(" ");
+                column![
+                    text("Text (optional)").size(12).style(color_text_muted()),
+                    text_input("", input_text.as_deref().unwrap_or(""))
+                        .on_input(Message::BuiltinKeyboardTextChanged),
+                    text("Keys (space-separated, optional)").size(12).style(color_text_muted()),
+                    text_input("e.g. -k Return", &keys_s).on_input(Message::BuiltinKeyboardKeysChanged),
+                    text("Linux MVP uses external tool: env `RIVERDECK_KEYBOARD_TOOL` (default: wtype).")
+                        .size(12)
+                        .style(color_text_muted()),
+                ]
+                .spacing(6)
+                .into()
+            }
+            BuiltinAction::PlaySound { path } => column![
+                text("Audio file path").size(12).style(color_text_muted()),
+                text_input("/path/to/file.wav", path).on_input(Message::BuiltinPlaySoundPathChanged),
+            ]
+            .spacing(6)
+            .into(),
+            BuiltinAction::SwitchProfile { mode } => {
+                let mut choices = vec![SwitchProfileChoice::Next, SwitchProfileChoice::Prev];
+                for p in &self.profiles {
+                    choices.push(SwitchProfileChoice::To(p.id));
+                }
+
+                let selected = match mode {
+                    actions::SwitchProfileMode::Next => SwitchProfileChoice::Next,
+                    actions::SwitchProfileMode::Prev => SwitchProfileChoice::Prev,
+                    actions::SwitchProfileMode::To { profile_id } => {
+                        SwitchProfileChoice::To(ProfileId(*profile_id))
+                    }
+                };
+
+                column![
+                    text("Mode").size(12).style(color_text_muted()),
+                    pick_list(choices, Some(selected), Message::BuiltinSwitchProfilePicked),
+                ]
+                .spacing(6)
+                .into()
+            }
+            BuiltinAction::DeviceBrightness { mode } => {
+                let (m, v) = match mode {
+                    actions::BrightnessMode::Set { percent } => (BrightnessModeChoice::Set, *percent as i32),
+                    actions::BrightnessMode::Increase { delta } => {
+                        (BrightnessModeChoice::Increase, *delta as i32)
+                    }
+                    actions::BrightnessMode::Decrease { delta } => {
+                        (BrightnessModeChoice::Decrease, *delta as i32)
+                    }
+                };
+
+                column![
+                    text("Mode").size(12).style(color_text_muted()),
+                    pick_list(
+                        vec![
+                            BrightnessModeChoice::Set,
+                            BrightnessModeChoice::Increase,
+                            BrightnessModeChoice::Decrease,
+                        ],
+                        Some(m),
+                        Message::BuiltinBrightnessModePicked,
+                    ),
+                    slider(0..=100, v, Message::BuiltinBrightnessValueChanged),
+                ]
+                .spacing(6)
+                .into()
+            }
+            BuiltinAction::SystemMonitoring { kind, .. } => {
+                let k = match kind {
+                    actions::MonitorKind::Cpu => MonitorKindChoice::Cpu,
+                    actions::MonitorKind::Memory => MonitorKindChoice::Memory,
+                    actions::MonitorKind::LoadAverage => MonitorKindChoice::LoadAverage,
+                };
+
+                column![
+                    text("Metric").size(12).style(color_text_muted()),
+                    pick_list(
+                        vec![
+                            MonitorKindChoice::Cpu,
+                            MonitorKindChoice::Memory,
+                            MonitorKindChoice::LoadAverage,
+                        ],
+                        Some(k),
+                        Message::BuiltinMonitorKindPicked,
+                    ),
+                    text("Displayed live in preview (device rendering later).")
+                        .size(12)
+                        .style(color_text_muted()),
+                ]
+                .spacing(6)
+                .into()
+            }
+        }
+    }
+
+    fn view_macro_editor(&self, steps: &[actions::MacroStep]) -> Element<'_, Message> {
+        let mut col = column![
+            row![
+                text("Macro steps").size(12).style(color_text_muted()),
+                horizontal_space(),
+                button(text("+")).style(iced::theme::Button::Secondary).on_press(Message::MacroAddStep),
+            ]
+            .align_items(Alignment::Center)
+            .spacing(8),
+        ]
+        .spacing(8);
+
+        if steps.is_empty() {
+            col = col.push(text("No steps yet.").style(color_text_muted()));
+            return col.into();
+        }
+
+        for (i, s) in steps.iter().enumerate() {
+            let kind = match s.action.as_ref() {
+                ActionBinding::Plugin(_) => MacroStepKindChoice::PluginAction,
+                ActionBinding::Builtin(BuiltinAction::IssueCommand { .. }) => {
+                    MacroStepKindChoice::IssueCommand
+                }
+                _ => MacroStepKindChoice::PluginAction,
+            };
+
+            let delay = s.delay_ms.map(|d| d.to_string()).unwrap_or_default();
+            let kind_picker = pick_list(
+                vec![MacroStepKindChoice::PluginAction, MacroStepKindChoice::IssueCommand],
+                Some(kind),
+                move |k| Message::MacroStepKindPicked { idx: i, kind: k },
+            );
+
+            let controls = row![
+                button(text("↑"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MacroMoveStepUp(i)),
+                button(text("↓"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MacroMoveStepDown(i)),
+                button(text("×"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::MacroRemoveStep(i)),
+            ]
+            .spacing(6);
+
+            let delay_input = text_input("Delay ms", &delay).on_input(move |v| {
+                Message::MacroStepDelayChanged {
+                    idx: i,
+                    value: v,
+                }
+            });
+
+            let editor: Element<Message> = match s.action.as_ref() {
+                ActionBinding::Plugin(p) => {
+                    let current = self
+                        .actions
+                        .iter()
+                        .find(|a| a.plugin_id == p.plugin_id && a.action_id == p.action_id)
+                        .cloned();
+                    pick_list(self.actions.clone(), current, move |c| {
+                        Message::MacroStepPluginPicked { idx: i, choice: c }
+                    })
+                    .into()
+                }
+                ActionBinding::Builtin(BuiltinAction::IssueCommand { command, .. }) => {
+                    text_input("bash command…", command).on_input(move |v| {
+                        Message::MacroStepCommandChanged { idx: i, value: v }
+                    })
+                    .into()
+                }
+                _ => text("Unsupported step type (edit by changing kind).")
+                    .style(color_text_muted())
+                    .into(),
+            };
+
+            col = col.push(
+                container(
+                    column![
+                        row![
+                            controls,
+                            horizontal_space(),
+                            text(format!("Step {}", i + 1)).style(color_text_muted()),
+                        ]
+                        .align_items(Alignment::Center),
+                        row![text("Kind").size(12).style(color_text_muted()), kind_picker]
+                            .spacing(10)
+                            .align_items(Alignment::Center),
+                        row![text("Delay").size(12).style(color_text_muted()), delay_input]
+                            .spacing(10)
+                            .align_items(Alignment::Center),
+                        editor,
+                    ]
+                    .spacing(6),
+                )
+                .padding(10)
+                .style(panel()),
+            );
+        }
+
+        col.into()
+    }
+
+    fn set_selected_action_mode(&mut self, mode: ActionModeChoice) {
+        let Some(slot) = self.selected_binding_mut() else {
+            return;
+        };
+
+        match mode {
+            ActionModeChoice::None => *slot = None,
+            ActionModeChoice::Plugin => {
+                // Keep existing plugin binding if present; otherwise choose first available action.
+                if matches!(slot, Some(ActionBinding::Plugin(_))) {
+                    return;
+                }
+                let Some(first) = self.actions.first().cloned() else {
+                    *slot = None;
+                    self.error = Some("No plugin actions available. Install a plugin first.".to_string());
+                    return;
+                };
+                let settings = default_settings_for_action(&self.plugins, &first);
+                *slot = Some(ActionBinding::Plugin(PluginActionBinding {
+                    plugin_id: first.plugin_id,
+                    action_id: first.action_id,
+                    settings,
+                }));
+            }
+            ActionModeChoice::Builtin => {
+                if matches!(slot, Some(ActionBinding::Builtin(_))) {
+                    return;
+                }
+                *slot = Some(ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                    command: String::new(),
+                    cwd: None,
+                    timeout_ms: None,
+                }));
+            }
+        }
+    }
+
+    fn assign_dragged_action_to_key(&mut self, idx: usize, dragged: DraggedAction) {
+        let Some(p) = &mut self.profile else {
+            self.error = Some("[Action] No profile loaded.".to_string());
+            return;
+        };
+        let Some(k) = p.keys.get_mut(idx) else {
+            return;
+        };
+
+        match dragged {
+            DraggedAction::Plugin(choice) => {
+                let settings = default_settings_for_action(&self.plugins, &choice);
+                k.action = Some(ActionBinding::Plugin(PluginActionBinding {
+                    plugin_id: choice.plugin_id,
+                    action_id: choice.action_id,
+                    settings,
+                }));
+            }
+            DraggedAction::Builtin(kind) => {
+                k.action = Some(ActionBinding::Builtin(match kind {
+                    BuiltinKindChoice::Macro => BuiltinAction::Macro { steps: vec![] },
+                    BuiltinKindChoice::IssueCommand => BuiltinAction::IssueCommand {
+                        command: String::new(),
+                        cwd: None,
+                        timeout_ms: None,
+                    },
+                    BuiltinKindChoice::KeyboardInput => BuiltinAction::KeyboardInput {
+                        text: None,
+                        keys: vec![],
+                    },
+                    BuiltinKindChoice::PlaySound => BuiltinAction::PlaySound {
+                        path: String::new(),
+                    },
+                    BuiltinKindChoice::SwitchProfile => BuiltinAction::SwitchProfile {
+                        mode: actions::SwitchProfileMode::Next,
+                    },
+                    BuiltinKindChoice::DeviceBrightness => BuiltinAction::DeviceBrightness {
+                        mode: actions::BrightnessMode::Set { percent: 30 },
+                    },
+                    BuiltinKindChoice::SystemMonitoring => BuiltinAction::SystemMonitoring {
+                        kind: actions::MonitorKind::Cpu,
+                        refresh_ms: Some(500),
+                    },
+                }));
+            }
+        }
+    }
+
+    fn set_selected_builtin_kind(&mut self, kind: BuiltinKindChoice) {
+        let Some(slot) = self.selected_binding_mut() else {
+            return;
+        };
+        *slot = Some(ActionBinding::Builtin(match kind {
+            BuiltinKindChoice::Macro => BuiltinAction::Macro { steps: vec![] },
+            BuiltinKindChoice::IssueCommand => BuiltinAction::IssueCommand {
+                command: String::new(),
+                cwd: None,
+                timeout_ms: None,
+            },
+            BuiltinKindChoice::KeyboardInput => BuiltinAction::KeyboardInput {
+                text: None,
+                keys: vec![],
+            },
+            BuiltinKindChoice::PlaySound => BuiltinAction::PlaySound {
+                path: String::new(),
+            },
+            BuiltinKindChoice::SwitchProfile => BuiltinAction::SwitchProfile {
+                mode: actions::SwitchProfileMode::Next,
+            },
+            BuiltinKindChoice::DeviceBrightness => BuiltinAction::DeviceBrightness {
+                mode: actions::BrightnessMode::Set { percent: 30 },
+            },
+            BuiltinKindChoice::SystemMonitoring => BuiltinAction::SystemMonitoring {
+                kind: actions::MonitorKind::Cpu,
+                refresh_ms: Some(500),
+            },
+        }));
+    }
+
+    fn update_selected_builtin(&mut self, f: impl FnOnce(&mut BuiltinAction)) {
+        let Some(slot) = self.selected_binding_mut() else {
+            return;
+        };
+        let Some(ActionBinding::Builtin(b)) = slot.as_mut() else {
+            return;
+        };
+        f(b)
+    }
+
+    fn selected_builtin_brightness_value(&self) -> Option<i32> {
+        let b = self.selected_binding()?.as_ref()?;
+        let ActionBinding::Builtin(BuiltinAction::DeviceBrightness { mode }) = b else {
+            return None;
+        };
+        Some(match mode {
+            actions::BrightnessMode::Set { percent } => *percent as i32,
+            actions::BrightnessMode::Increase { delta } => *delta as i32,
+            actions::BrightnessMode::Decrease { delta } => *delta as i32,
+        })
+    }
+
+    fn macro_add_step(&mut self) {
+        let default_plugin = self.actions.first().cloned();
+        let default_settings = default_plugin
+            .as_ref()
+            .map(|c| default_settings_for_action(&self.plugins, c));
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+
+            let action = if let Some(first) = default_plugin {
+                ActionBinding::Plugin(PluginActionBinding {
+                    plugin_id: first.plugin_id,
+                    action_id: first.action_id,
+                    settings: default_settings.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                })
+            } else {
+                ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                    command: String::new(),
+                    cwd: None,
+                    timeout_ms: None,
+                })
+            };
+
+            steps.push(actions::MacroStep {
+                action: Box::new(action),
+                delay_ms: None,
+            });
+        });
+    }
+
+    fn macro_remove_step(&mut self, idx: usize) {
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            if idx < steps.len() {
+                steps.remove(idx);
+            }
+        });
+    }
+
+    fn macro_move_step(&mut self, idx: usize, up: bool) {
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            if steps.is_empty() || idx >= steps.len() {
+                return;
+            }
+            if up {
+                if idx == 0 {
+                    return;
+                }
+                steps.swap(idx, idx - 1);
+            } else {
+                if idx + 1 >= steps.len() {
+                    return;
+                }
+                steps.swap(idx, idx + 1);
+            }
+        });
+    }
+
+    fn macro_set_step_kind(&mut self, idx: usize, kind: MacroStepKindChoice) {
+        let default_plugin = self.actions.first().cloned();
+        let default_settings = default_plugin
+            .as_ref()
+            .map(|c| default_settings_for_action(&self.plugins, c));
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            let Some(step) = steps.get_mut(idx) else {
+                return;
+            };
+            step.action = Box::new(match kind {
+                MacroStepKindChoice::PluginAction => {
+                    if let Some(first) = default_plugin {
+                        ActionBinding::Plugin(PluginActionBinding {
+                            plugin_id: first.plugin_id,
+                            action_id: first.action_id,
+                            settings: default_settings.unwrap_or_else(|| {
+                                serde_json::Value::Object(serde_json::Map::new())
+                            }),
+                        })
+                    } else {
+                        ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                            command: String::new(),
+                            cwd: None,
+                            timeout_ms: None,
+                        })
+                    }
+                }
+                MacroStepKindChoice::IssueCommand => ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                    command: String::new(),
+                    cwd: None,
+                    timeout_ms: None,
+                }),
+            });
+        });
+    }
+
+    fn macro_set_step_delay(&mut self, idx: usize, value: String) {
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            let Some(step) = steps.get_mut(idx) else {
+                return;
+            };
+            let s = value.trim();
+            step.delay_ms = if s.is_empty() { None } else { s.parse::<u64>().ok() };
+        });
+    }
+
+    fn macro_set_step_plugin(&mut self, idx: usize, choice: ActionChoice) {
+        let settings = default_settings_for_action(&self.plugins, &choice);
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            let Some(step) = steps.get_mut(idx) else {
+                return;
+            };
+            step.action = Box::new(ActionBinding::Plugin(PluginActionBinding {
+                plugin_id: choice.plugin_id,
+                action_id: choice.action_id,
+                settings,
+            }));
+        });
+    }
+
+    fn macro_set_step_command(&mut self, idx: usize, value: String) {
+        self.update_selected_builtin(|b| {
+            let BuiltinAction::Macro { steps } = b else {
+                return;
+            };
+            let Some(step) = steps.get_mut(idx) else {
+                return;
+            };
+            step.action = Box::new(ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                command: value,
+                cwd: None,
+                timeout_ms: None,
+            }));
+        });
     }
 
     fn view_deck_preview(&self, key_count: u8, pressed: &[bool]) -> Element<'_, Message> {
@@ -1252,55 +2924,81 @@ impl App {
 
         // Stream Deck+ preview: keys + touch strip + 4 dials.
         let content = if key_count == 8 {
-            let strip = container(
-                text("Touch strip")
-                    .size(12)
-                    .style(color_text_muted()),
-            )
+            let strip_h = 52.0;
+            let dial_size = 56.0;
+            let strip_selected = self.selected_control == Some(SelectedControl::TouchStrip);
+
+            let strip = container(text("Touch strip").size(12).style(color_text_muted()))
             .width(Length::Fill)
-            .height(Length::Fixed(26.0))
+            .height(Length::Fixed(strip_h))
             .center_x()
             .center_y()
-            .style(iced::theme::Container::Custom(Box::new(|theme: &Theme| {
+            .style(iced::theme::Container::Custom(Box::new(move |theme: &Theme| {
                 let p = theme.extended_palette();
                 iced::widget::container::Appearance {
                     background: Some(Background::Color(p.background.base.color)),
                     text_color: Some(p.background.base.text),
                     border: Border {
-                        radius: 10.0.into(),
+                        // Square strip (sleek / hardware-like)
+                        radius: 0.0.into(),
                         width: 1.0,
-                        color: Color::from_rgba8(255, 255, 255, 0.08),
+                        color: if strip_selected {
+                            Color::from_rgba8(255, 255, 255, 0.22)
+                        } else {
+                            Color::from_rgba8(255, 255, 255, 0.08)
+                        },
                     },
                     shadow: Shadow::default(),
                 }
             })));
 
             let dial = |idx: usize| {
-                let label = format!("Dial {}", idx + 1);
+                let dial_selected = self.selected_control == Some(SelectedControl::Dial(idx));
+                let label = self
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.dials.get(idx))
+                    .map(|d| d.label.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| format!("Dial {}", idx + 1));
                 container(text(label).size(11).style(color_text_muted()))
-                    .width(Length::Fixed(64.0))
-                    .height(Length::Fixed(44.0))
+                    .width(Length::Fixed(dial_size))
+                    .height(Length::Fixed(dial_size))
                     .center_x()
                     .center_y()
-                    .style(iced::theme::Container::Custom(Box::new(|theme: &Theme| {
+                    .style(iced::theme::Container::Custom(Box::new(move |theme: &Theme| {
                         let p = theme.extended_palette();
                         iced::widget::container::Appearance {
                             background: Some(Background::Color(p.background.base.color)),
                             text_color: Some(p.background.base.text),
                             border: Border {
-                                // Less "toy"/pill-like; feels more modern and consistent.
-                                radius: 14.0.into(),
+                                // Fully round knobs.
+                                radius: 999.0.into(),
                                 width: 1.0,
-                                color: Color::from_rgba8(255, 255, 255, 0.08),
+                                color: if dial_selected {
+                                    Color::from_rgba8(255, 255, 255, 0.22)
+                                } else {
+                                    Color::from_rgba8(255, 255, 255, 0.08)
+                                },
                             },
                             shadow: Shadow::default(),
                         }
                     })))
             };
 
-            let dials = row![dial(0), dial(1), dial(2), dial(3)]
+            let strip = mouse_area(strip).on_press(Message::SelectControl(SelectedControl::TouchStrip));
+            let dials = container(
+                row![
+                    mouse_area(dial(0)).on_press(Message::SelectControl(SelectedControl::Dial(0))),
+                    mouse_area(dial(1)).on_press(Message::SelectControl(SelectedControl::Dial(1))),
+                    mouse_area(dial(2)).on_press(Message::SelectControl(SelectedControl::Dial(2))),
+                    mouse_area(dial(3)).on_press(Message::SelectControl(SelectedControl::Dial(3))),
+                ]
                 .spacing(12)
-                .align_items(Alignment::Center);
+                .align_items(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .center_x();
 
             column![grid, strip, dials].spacing(gap as u16)
         } else {
@@ -1310,7 +3008,8 @@ impl App {
         let width = (cols as f32 * key) + ((cols - 1) as f32 * gap) + 2.0 * pad;
         let base_height = (rows as f32 * key) + ((rows - 1) as f32 * gap) + 2.0 * pad;
         let extra = if key_count == 8 {
-            26.0 + 44.0 + (gap * 2.0)
+            // Touch strip + dials + gaps between sections
+            52.0 + 56.0 + (gap * 2.0)
         } else {
             0.0
         };
@@ -1326,7 +3025,8 @@ impl App {
 
     fn view_deck_key(&self, idx: usize, pressed: &[bool]) -> Element<'_, Message> {
         let is_pressed = pressed.get(idx).copied().unwrap_or(false);
-        let is_selected = self.selected_key == Some(idx);
+        let is_selected = self.selected_control == Some(SelectedControl::Key(idx));
+        let is_drop_hover = self.drag.dragging.is_some() && self.drag.over_key == Some(idx);
         let (key, _gap, _pad, _radius) =
             deck_metrics(self.connected.as_ref().map(|c| c.key_count).unwrap_or(15));
 
@@ -1342,7 +3042,7 @@ impl App {
             .as_ref()
             .and_then(|p| p.keys.get(idx))
             .and_then(|k| k.action.as_ref())
-            .and_then(|a| self.action_label(&a.plugin_id, &a.action_id));
+            .and_then(|a| self.binding_hint(a));
 
         let max_title = if key <= 64.0 { 10 } else { 14 };
         let max_sub = if key <= 64.0 { 12 } else { 18 };
@@ -1375,15 +3075,23 @@ impl App {
         .spacing(2)
         .align_items(Alignment::Center);
 
-        button(container(content).center_x().center_y())
+        let key_btn = button(container(content).center_x().center_y())
             .width(Length::Fixed(key))
             .height(Length::Fixed(key))
             .padding(0)
-            .on_press(Message::SelectKey(idx))
+            .on_press(Message::SelectControl(SelectedControl::Key(idx)))
             .style(iced::theme::Button::custom(DeckKeyStyle {
                 pressed: is_pressed,
                 selected: is_selected,
+                drop_hover: is_drop_hover,
             }))
+            ;
+
+        // Drop target surface: release mouse over a key to assign the currently dragged action.
+        mouse_area(key_btn)
+            .on_enter(Message::DragOverKey(Some(idx)))
+            .on_exit(Message::DragOverKey(None))
+            .on_release(Message::DropOnKey(idx))
             .into()
     }
 
@@ -1392,25 +3100,85 @@ impl App {
         Some(action.name.clone())
     }
 
-    fn current_action_choice(&self, idx: usize) -> Option<ActionChoice> {
-        let p = self.profile.as_ref()?;
-        let k = p.keys.get(idx)?;
-        let b = k.action.as_ref()?;
+    fn binding_hint(&self, binding: &ActionBinding) -> Option<String> {
+        match binding {
+            ActionBinding::Plugin(p) => self.action_label(&p.plugin_id, &p.action_id),
+            ActionBinding::Builtin(b) => Some(match b {
+                actions::BuiltinAction::Macro { .. } => "Macro".to_string(),
+                actions::BuiltinAction::IssueCommand { .. } => "Issue Command".to_string(),
+                actions::BuiltinAction::KeyboardInput { .. } => "Keyboard Input".to_string(),
+                actions::BuiltinAction::PlaySound { .. } => "Play Sound".to_string(),
+                actions::BuiltinAction::SwitchProfile { .. } => "Switch Profile".to_string(),
+                actions::BuiltinAction::DeviceBrightness { .. } => "Device Brightness".to_string(),
+                actions::BuiltinAction::SystemMonitoring { kind, .. } => match kind {
+                    actions::MonitorKind::Cpu => format!("CPU {:.0}%", self.sys_snapshot.cpu_percent),
+                    actions::MonitorKind::Memory => {
+                        let used = self.sys_snapshot.mem_used as f32 / (1024.0 * 1024.0);
+                        let total = self.sys_snapshot.mem_total as f32 / (1024.0 * 1024.0);
+                        format!("Mem {:.0}/{:.0}MB", used, total)
+                    }
+                    actions::MonitorKind::LoadAverage => {
+                        let (a, b, c) = self.sys_snapshot.load;
+                        format!("Load {:.2} {:.2} {:.2}", a, b, c)
+                    }
+                },
+            }),
+        }
+    }
+
+    fn refresh_system_snapshot(&mut self) {
+        // Lightweight periodic refresh for UI display (no device rendering yet).
+        // Keep it conservative to avoid adding overhead.
+        if self.sys_last_refresh.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.sys_last_refresh = Instant::now();
+
+        use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind};
+        let refresh = RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything());
+        self.sys.refresh_specifics(refresh);
+
+        // CPU usage: average across all CPUs.
+        let cpus = self.sys.cpus();
+        let cpu_percent = if cpus.is_empty() {
+            0.0
+        } else {
+            cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / (cpus.len() as f32)
+        };
+
+        let mem_total = self.sys.total_memory();
+        let mem_used = self.sys.used_memory();
+
+        let load = sysinfo::System::load_average();
+        self.sys_snapshot = SystemSnapshot {
+            cpu_percent,
+            mem_used,
+            mem_total,
+            load: (load.one, load.five, load.fifteen),
+        };
+    }
+
+    fn current_action_choice(&self) -> Option<ActionChoice> {
+        let b = match self.selected_binding()?.as_ref()? {
+            ActionBinding::Plugin(p) => p,
+            ActionBinding::Builtin(_) => return None,
+        };
         self.actions
             .iter()
             .find(|a| a.plugin_id == b.plugin_id && a.action_id == b.action_id)
             .cloned()
     }
 
-    fn view_action_settings(&self, idx: usize) -> Element<'_, Message> {
-        let Some(p) = &self.profile else {
-            return text("No profile loaded.").into();
-        };
-        let Some(k) = p.keys.get(idx) else {
-            return text("Invalid key index.").into();
-        };
-        let Some(binding) = &k.action else {
+    fn view_action_settings(&self) -> Element<'_, Message> {
+        let Some(binding) = self.selected_binding().and_then(|b| b.as_ref()) else {
             return text("No action bound.").into();
+        };
+
+        let ActionBinding::Plugin(binding) = binding else {
+            // Builtin actions have their own editor (added in `ui-config` todo).
+            return text("Builtin action settings are not shown here yet.").into();
         };
 
         let Some((_plugin, action_def)) =
@@ -1493,6 +3261,7 @@ impl App {
 struct DeckKeyStyle {
     pressed: bool,
     selected: bool,
+    drop_hover: bool,
 }
 
 impl iced::widget::button::StyleSheet for DeckKeyStyle {
@@ -1507,7 +3276,9 @@ impl iced::widget::button::StyleSheet for DeckKeyStyle {
             palette.background.strong.color
         };
 
-        let border_color = if self.selected {
+        let border_color = if self.drop_hover {
+            palette.primary.base.color
+        } else if self.selected {
             palette.primary.base.color
         } else if self.pressed {
             palette.success.base.color
@@ -1630,37 +3401,36 @@ fn default_marketplace_sources() -> Vec<MarketplaceSource> {
     let mut out = vec![MarketplaceSource {
         name: "Rivul (OpenAction)".to_string(),
         index_url: "https://openactionapi.github.io/plugins/catalogue.json".to_string(),
+        icon_base_url: Some("https://openactionapi.github.io/plugins/icons/".to_string()),
     }];
 
     // Optional user-provided list:
     // OPENACTION_MARKETPLACES="Name|https://...;Other|https://..."
+    // Optional third field:
+    // OPENACTION_MARKETPLACES="Name|https://...|https://icons/;Other|https://..."
     if let Ok(raw) = std::env::var("OPENACTION_MARKETPLACES") {
         for part in raw.split(';') {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
-            let mut it = part.splitn(2, '|');
+            let mut it = part.split('|');
             let name = it.next().unwrap_or("").trim();
             let url = it.next().unwrap_or("").trim();
+            let icon_base_url = it.next().map(|s| s.trim()).filter(|s| !s.is_empty());
             if name.is_empty() || url.is_empty() {
                 continue;
             }
             let src = MarketplaceSource {
                 name: name.to_string(),
                 index_url: url.to_string(),
+                icon_base_url: icon_base_url.map(|s| s.to_string()),
             };
             if !out.contains(&src) {
                 out.push(src);
             }
         }
     }
-
-    // Placeholder "your own" marketplace, editable in UI.
-    out.push(MarketplaceSource {
-        name: "My Marketplace".to_string(),
-        index_url: String::new(),
-    });
 
     out
 }
@@ -1769,14 +3539,157 @@ async fn fetch_marketplace_async(url: String) -> Result<Vec<MarketplacePlugin>, 
         .map_err(|e| e.to_string())
 }
 
+async fn fetch_icon_async(url: String) -> Result<Vec<u8>, String> {
+    openaction::marketplace::fetch_bytes(&url)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn sleep_ms_async(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await
+}
+
+async fn issue_command_async(
+    command: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc").arg(command);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    let fut = async move {
+        let status = cmd.status().await.map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Command exited with status: {status}"))
+        }
+    };
+
+    if let Some(ms) = timeout_ms {
+        tokio::time::timeout(Duration::from_millis(ms), fut)
+            .await
+            .map_err(|_| "Command timed out".to_string())?
+    } else {
+        fut.await
+    }
+}
+
+async fn keyboard_input_async(text: Option<String>, keys: Vec<String>) -> Result<(), String> {
+    // Linux MVP: delegate to an external tool.
+    // Configure with RIVERDECK_KEYBOARD_TOOL, default: wtype
+    let tool = std::env::var("RIVERDECK_KEYBOARD_TOOL").unwrap_or_else(|_| "wtype".to_string());
+
+    if let Some(text) = text {
+        let cmd = format!("{tool} {}", shell_escape(&text));
+        return issue_command_async(cmd, None, Some(5_000)).await;
+    }
+
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    // Treat `keys` as tool arguments (e.g. for wtype: `-k Return`).
+    let args = keys
+        .into_iter()
+        .map(|k| shell_escape(&k))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cmd = format!("{tool} {args}");
+    issue_command_async(cmd, None, Some(5_000)).await
+}
+
+fn shell_escape(s: &str) -> String {
+    // Minimal, safe shell escaping for bash -lc.
+    // Wrap in single quotes and escape internal single quotes.
+    let mut out = String::from("'");
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+async fn play_sound_async(path: String) -> Result<(), String> {
+    // Use a blocking thread because rodio decoding + playback is blocking.
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let (_stream, handle) = rodio::OutputStream::try_default().map_err(|e| e.to_string())?;
+        let sink = rodio::Sink::try_new(&handle).map_err(|e| e.to_string())?;
+
+        let f = File::open(&path).map_err(|e| e.to_string())?;
+        let src = rodio::Decoder::new(BufReader::new(f)).map_err(|e| e.to_string())?;
+        sink.append(src);
+        sink.sleep_until_end();
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn marketplace_icon_url(source: &MarketplaceSource, plugin: &MarketplacePlugin) -> Option<String> {
+    if let Some(url) = &plugin.icon_url {
+        if !url.trim().is_empty() {
+            return Some(url.clone());
+        }
+    }
+    let base = source.icon_base_url.as_ref()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let mut out = base.to_string();
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out.push_str(&plugin.id);
+    out.push_str(".png");
+    Some(out)
+}
+
+fn parse_bg_rgb(raw: &str) -> Option<[u8; 3]> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let r = parts[0].parse::<u8>().ok()?;
+    let g = parts[1].parse::<u8>().ok()?;
+    let b = parts[2].parse::<u8>().ok()?;
+    Some([r, g, b])
+}
+
 async fn invoke_action_async(
     plugin: InstalledPlugin,
     action_id: String,
-    key: u8,
+    control: InvocationControl,
+    event: InvocationEvent,
     settings: serde_json::Value,
 ) -> Result<(), String> {
     let rt = ActionRuntime::new();
-    rt.invoke(&plugin, &action_id, key, "key_down", settings)
+    rt.invoke(
+        &plugin,
+        &action_id,
+        control,
+        event,
+        settings,
+    )
         .await
         .map_err(|e| e.to_string())
 }
@@ -1847,6 +3760,11 @@ fn set_current_key_setting(
     let Some(binding) = &mut k.action else {
         return;
     };
+
+    let ActionBinding::Plugin(binding) = binding else {
+        return;
+    };
+
     let obj = binding.settings.as_object_mut();
     if let Some(obj) = obj {
         obj.insert(key, value);

@@ -18,6 +18,9 @@ pub struct MarketplacePlugin {
     pub author: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
+    /// Optional URL pointing to an icon for display in UIs.
+    #[serde(default)]
+    pub icon_url: Option<String>,
     /// Optional URL for downloading/installing the plugin artifact.
     ///
     /// Note: the install flow is intentionally out of scope for MVP.
@@ -33,11 +36,13 @@ struct CatalogueEntry {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
-    pub description: String,
+    pub description: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
     #[serde(default)]
     pub download_url: Option<String>,
 }
@@ -57,12 +62,12 @@ enum MarketplaceResponse {
 /// - `{ "plugins": [{...}, {...}] }`
 /// - `{ "<plugin_id>": { "name": "...", ... }, ... }` (OpenAction catalogue.json)
 pub async fn fetch_plugins(index_url: &str) -> anyhow::Result<Vec<MarketplacePlugin>> {
-    let client = reqwest::Client::builder()
-        .user_agent("RiverDeck-Redux/0.1 (OpenAction Marketplace)")
-        .build()?;
-
-    let resp = client.get(index_url).send().await?.error_for_status()?;
-    let parsed: MarketplaceResponse = resp.json().await?;
+    let bytes = fetch_bytes(index_url).await?;
+    let parsed: MarketplaceResponse = serde_json::from_slice(&bytes).map_err(|e| {
+        // Include a small, safe preview to help diagnose wrong endpoints (HTML, etc.).
+        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(240)]);
+        anyhow::anyhow!("failed to parse marketplace JSON: {e}. body preview: {preview}")
+    })?;
 
     let mut plugins = match parsed {
         MarketplaceResponse::List(list) => list,
@@ -73,9 +78,10 @@ pub async fn fetch_plugins(index_url: &str) -> anyhow::Result<Vec<MarketplacePlu
                 id,
                 name: e.name,
                 version: e.version,
-                description: e.description,
+                description: e.description.unwrap_or_default(),
                 author: e.author,
                 homepage: e.homepage,
+                icon_url: e.icon_url,
                 download_url: e.download_url,
             })
             .collect(),
@@ -83,6 +89,25 @@ pub async fn fetch_plugins(index_url: &str) -> anyhow::Result<Vec<MarketplacePlu
 
     plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(plugins)
+}
+
+/// Fetch raw bytes from a marketplace URL.
+///
+/// We set `Accept-Encoding: identity` to keep things predictable (plain bodies),
+/// especially when `reqwest` is built with a reduced feature set.
+pub async fn fetch_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .user_agent("RiverDeck-Redux/0.1 (OpenAction Marketplace)")
+        .build()?;
+
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(resp.bytes().await?.to_vec())
 }
 
 

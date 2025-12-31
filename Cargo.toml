@@ -9,6 +9,7 @@ members = [
   "crates/openaction",
   "crates/plugin-runtime",
   "crates/storage",
+  "crates/actions",
   "crates/cli",
 ]
 
@@ -24,13 +25,16 @@ async-trait = "0.1"
 bytes = "1.7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "5.0"
+font8x8 = "0.3"
 futures = "0.3"
 hidapi = "2.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 iced = { version = "0.12", features = ["tokio", "image"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate"] }
+rodio = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sysinfo = "0.33"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 tracing = "0.1"

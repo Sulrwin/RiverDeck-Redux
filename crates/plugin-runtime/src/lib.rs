@@ -9,11 +9,31 @@ use tokio::process::Command;
 use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InvocationControl {
+    Key { index: u8 },
+    Dial { index: u8 },
+    TouchStrip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InvocationEvent {
+    KeyDown,
+    KeyUp,
+    DialDown,
+    DialUp,
+    DialRotate { delta: i32 },
+    TouchTap { x: u16 },
+    TouchDrag { delta_x: i16 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionInvocation {
     pub plugin_id: String,
     pub action_id: String,
-    pub event: String,
-    pub key: u8,
+    pub control: InvocationControl,
+    pub event: InvocationEvent,
     #[serde(default)]
     pub settings: serde_json::Value,
 }
@@ -29,14 +49,14 @@ impl ActionRuntime {
         &self,
         plugin: &InstalledPlugin,
         action: &str,
-        key: u8,
-        event: &str,
+        control: InvocationControl,
+        event: InvocationEvent,
         settings: serde_json::Value,
     ) -> anyhow::Result<()> {
         let exe = plugin_executable_path(plugin)
             .ok_or_else(|| anyhow::anyhow!("plugin has no executable for this platform"))?;
 
-        invoke_process(exe, &plugin.manifest, action, key, event, settings).await
+        invoke_process(exe, &plugin.manifest, action, control, event, settings).await
     }
 }
 
@@ -50,15 +70,15 @@ async fn invoke_process(
     exe: PathBuf,
     manifest: &PluginManifest,
     action: &str,
-    key: u8,
-    event: &str,
+    control: InvocationControl,
+    event: InvocationEvent,
     settings: serde_json::Value,
 ) -> anyhow::Result<()> {
     let payload = ActionInvocation {
         plugin_id: manifest.id.clone(),
         action_id: action.to_string(),
-        event: event.to_string(),
-        key,
+        control,
+        event,
         settings,
     };
 
