@@ -99,7 +99,8 @@ impl Application for App {
     }
 
     fn theme(&self) -> Self::Theme {
-        Theme::Dark
+        // A more modern baseline look (affects all default widget styling).
+        Theme::TokyoNightStorm
     }
 
     fn update(&mut self, _message: Self::Message) -> Command<Self::Message> {
@@ -643,14 +644,12 @@ impl App {
         let bar = row![
             column![
                 text("RiverDeck-Redux").size(22),
-                text(status).size(12).style(Color::from_rgb8(170, 175, 185)),
+                text(status).size(12).style(color_text_muted()),
             ]
             .spacing(2),
             horizontal_space(),
             column![
-                text("Device")
-                    .size(12)
-                    .style(Color::from_rgb8(170, 175, 185)),
+                text("Device").size(12).style(color_text_muted()),
                 pick_list(
                     self.device_choices.clone(),
                     device_selected,
@@ -659,9 +658,7 @@ impl App {
             ]
             .spacing(4),
             column![
-                text("Profile")
-                    .size(12)
-                    .style(Color::from_rgb8(170, 175, 185)),
+                text("Profile").size(12).style(color_text_muted()),
                 row![
                     pick_list(
                         self.profile_choices.clone(),
@@ -679,7 +676,9 @@ impl App {
                 .align_items(Alignment::Center)
             ]
             .spacing(4),
-            button(text("Refresh")).on_press(Message::RefreshDevices),
+            button(text("Refresh"))
+                .style(iced::theme::Button::Secondary)
+                .on_press(Message::RefreshDevices),
         ]
         .align_items(Alignment::Center)
         .spacing(14);
@@ -713,10 +712,7 @@ impl App {
     }
 
     fn view_sidebar_plugins(&self) -> Element<'_, Message> {
-        let mut col = column![text("Plugins")
-            .size(16)
-            .style(Color::from_rgb8(210, 215, 225))]
-        .spacing(8);
+        let mut col = column![text("Plugins").size(16)].spacing(8);
 
         col = col.push(
             text_input(
@@ -727,8 +723,12 @@ impl App {
         );
         col = col.push(
             row![
-                button(text("Install")).on_press(Message::InstallPluginFromPath),
-                button(text("Refresh")).on_press(Message::RefreshPlugins),
+                button(text("Install"))
+                    .style(iced::theme::Button::Primary)
+                    .on_press(Message::InstallPluginFromPath),
+                button(text("Refresh"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::RefreshPlugins),
             ]
             .spacing(8),
         );
@@ -745,9 +745,7 @@ impl App {
     }
 
     fn view_actions_panel(&self) -> Element<'_, Message> {
-        let header = text("Actions")
-            .size(16)
-            .style(Color::from_rgb8(210, 215, 225));
+        let header = text("Actions").size(16);
 
         let search = text_input("Search actions…", &self.action_search)
             .on_input(Message::ActionSearchChanged);
@@ -780,7 +778,7 @@ impl App {
                     "No actions match your search."
                 })
                 .size(13)
-                .style(Color::from_rgb8(170, 175, 185)),
+                .style(color_text_muted()),
             );
         }
 
@@ -808,12 +806,10 @@ impl App {
 
         let title = row![
             column![
-                text("Preview")
-                    .size(16)
-                    .style(Color::from_rgb8(210, 215, 225)),
+                text("Preview").size(16),
                 text(selected)
                     .size(12)
-                    .style(Color::from_rgb8(170, 175, 185)),
+                    .style(color_text_muted()),
             ]
             .spacing(2),
             horizontal_space(),
@@ -828,7 +824,7 @@ impl App {
                     text("Connect a device to see a preview.").size(16),
                     text("Tip: use the left sidebar to select a device and click Connect.")
                         .size(13)
-                        .style(Color::from_rgb8(170, 175, 185)),
+                        .style(color_text_muted()),
                 ]
                 .spacing(6),
             )
@@ -869,9 +865,7 @@ impl App {
     }
 
     fn view_inspector_panel(&self) -> Element<'_, Message> {
-        let header = text("Inspector")
-            .size(16)
-            .style(Color::from_rgb8(210, 215, 225));
+        let header = text("Inspector").size(16);
 
         let body = match (self.connected.as_ref(), self.selected_key) {
             (None, _) => text("Connect a device to inspect keys.").into(),
@@ -905,7 +899,7 @@ impl App {
                 "State: Released"
             })
             .size(13)
-            .style(Color::from_rgb8(170, 175, 185)),
+            .style(color_text_muted()),
         ]
         .spacing(6);
 
@@ -959,7 +953,7 @@ impl App {
             let strip = container(
                 text("Touch strip")
                     .size(12)
-                    .style(Color::from_rgb8(170, 175, 185)),
+                    .style(color_text_muted()),
             )
             .width(Length::Fill)
             .height(Length::Fixed(26.0))
@@ -981,7 +975,7 @@ impl App {
 
             let dial = |idx: usize| {
                 let label = format!("Dial {}", idx + 1);
-                container(text(label).size(11).style(Color::from_rgb8(170, 175, 185)))
+                container(text(label).size(11).style(color_text_muted()))
                     .width(Length::Fixed(64.0))
                     .height(Length::Fixed(44.0))
                     .center_x()
@@ -992,7 +986,8 @@ impl App {
                             background: Some(Background::Color(p.background.base.color)),
                             text_color: Some(p.background.base.text),
                             border: Border {
-                                radius: 999.0.into(),
+                                // Less "toy"/pill-like; feels more modern and consistent.
+                                radius: 14.0.into(),
                                 width: 1.0,
                                 color: Color::from_rgba8(255, 255, 255, 0.08),
                             },
@@ -1069,7 +1064,7 @@ impl App {
                 .map(|s| {
                     text(s)
                         .size(10)
-                        .style(Color::from_rgb8(170, 175, 185))
+                        .style(color_text_muted())
                         .width(Length::Fill)
                         .horizontal_alignment(Horizontal::Center)
                 })
@@ -1224,12 +1219,12 @@ impl iced::widget::button::StyleSheet for DeckKeyStyle {
             border: Border {
                 color: border_color,
                 width: if self.selected { 2.0 } else { 1.0 },
-                radius: 10.0.into(),
+                radius: 8.0.into(),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.45),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 10.0,
+                color: Color::from_rgba8(0, 0, 0, 0.28),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
             },
             ..Default::default()
         }
@@ -1270,14 +1265,15 @@ fn panel() -> iced::theme::Container {
             background: Some(Background::Color(p.background.weak.color)),
             text_color: Some(p.background.base.text),
             border: Border {
-                radius: 12.0.into(),
+                radius: 10.0.into(),
                 width: 1.0,
                 color: p.background.strong.color,
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.35),
-                offset: iced::Vector::new(0.0, 6.0),
-                blur_radius: 18.0,
+                // Softer, "flowing" elevation (less harsh toy-like drop shadow).
+                color: Color::from_rgba8(0, 0, 0, 0.22),
+                offset: iced::Vector::new(0.0, 10.0),
+                blur_radius: 28.0,
             },
         }
     }))
@@ -1310,10 +1306,11 @@ fn deck_grid_dims(key_count: u8) -> (usize, usize) {
 /// Returns (key_size_px, gap_px, padding_px, deck_radius_px)
 fn deck_metrics(key_count: u8) -> (f32, f32, f32, f32) {
     match key_count {
-        8 => (72.0, 12.0, 22.0, 26.0),
-        32 => (62.0, 10.0, 20.0, 22.0),
-        6 => (80.0, 14.0, 24.0, 26.0),
-        _ => (74.0, 12.0, 24.0, 26.0),
+        // Slightly tighter + less rounded for a modern, cleaner feel.
+        8 => (72.0, 10.0, 18.0, 18.0),
+        32 => (62.0, 9.0, 16.0, 16.0),
+        6 => (80.0, 12.0, 18.0, 18.0),
+        _ => (74.0, 10.0, 18.0, 18.0),
     }
 }
 
@@ -1329,12 +1326,19 @@ fn deck_body_style(radius: f32) -> iced::theme::Container {
                 color: Color::from_rgba8(255, 255, 255, 0.06),
             },
             shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.6),
-                offset: iced::Vector::new(0.0, 10.0),
-                blur_radius: 30.0,
+                color: Color::from_rgba8(0, 0, 0, 0.32),
+                offset: iced::Vector::new(0.0, 16.0),
+                blur_radius: 42.0,
             },
         }
     }))
+}
+
+fn color_text_muted() -> Color {
+    // Keep muted text aligned with the chosen theme, without hard-coding a random gray.
+    let p = Theme::TokyoNightStorm.extended_palette();
+    let base = p.background.base.text;
+    Color { a: 0.72, ..base }
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
