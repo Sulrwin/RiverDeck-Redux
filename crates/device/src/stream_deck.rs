@@ -145,10 +145,18 @@ impl StreamDeckService {
             .unwrap();
 
         let name = candidates[0].name.clone();
+        let product_lower = name.to_ascii_lowercase();
         let key_count = match candidates[0].product_id {
             0x0063 => 6,  // Mini
             0x006c => 32, // XL (common)
-            _ => 15,      // Original/MK.2 default
+            _ => {
+                // Heuristic: Stream Deck+ is 8 keys (2x4) + touch strip + 4 dials.
+                if product_lower.contains("plus") || product_lower.contains("stream deck +") {
+                    8
+                } else {
+                    15 // Original/MK.2 default
+                }
+            }
         };
 
         let (event_tx, event_rx) = mpsc::channel(128);
@@ -194,6 +202,11 @@ fn run_stream_deck_thread(
     let mut buf = vec![0u8; 64];
 
     loop {
+        // If the UI dropped both the event receiver and the command sender, exit cleanly.
+        if event_tx.is_closed() && cmd_rx.is_closed() {
+            return Ok(());
+        }
+
         // 1) Poll for commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {

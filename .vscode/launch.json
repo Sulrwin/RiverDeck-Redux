@@ -1,0 +1,136 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+    
+        {
+            "name": "Debug unit tests in library 'app_core'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=app-core"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'ui-iced'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=ui-iced",
+                    "--package=ui-iced"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'ui-iced'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=ui-iced",
+                    "--package=ui-iced"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'device'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=device"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'transport_hid'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=transport-hid"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'openaction'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=openaction"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'storage'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=storage"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'plugin_runtime'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=plugin-runtime"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'render'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=render"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'cli'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=cli",
+                    "--package=cli"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'cli'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=cli",
+                    "--package=cli"
+                ]
+            }
+        }
+    ]
+}
