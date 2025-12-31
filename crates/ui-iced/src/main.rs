@@ -606,6 +606,25 @@ impl Application for App {
                 Command::perform(save_profile_async(p), Message::ProfileSaved)
             }
             Message::ProfileSaved(res) => {
+                match res {
+                    Ok(()) => {
+                        // Best-effort: push LCD displays after saving.
+                        let Some(c) = self.connected.as_ref() else {
+                            return Command::none();
+                        };
+                        let Some(p) = self.profile.clone() else {
+                            return Command::none();
+                        };
+                        let controller = c.controller.clone();
+                        Command::perform(apply_displays_async(controller, p), Message::DisplaysApplied)
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        Command::none()
+                    }
+                }
+            }
+            Message::DisplaysApplied(res) => {
                 if let Err(e) = res {
                     self.error = Some(e);
                 }
@@ -1023,11 +1042,11 @@ impl Application for App {
                     return Command::none();
                 };
 
+                let settings = default_settings_for_action(&self.plugins, &choice);
                 let Some(slot) = self.selected_binding_mut() else {
                     self.error = Some("Invalid binding target for selected control.".to_string());
                     return Command::none();
                 };
-                let settings = default_settings_for_action(&self.plugins, &choice);
                 *slot = Some(ActionBinding::Plugin(PluginActionBinding {
                     plugin_id: choice.plugin_id.clone(),
                     action_id: choice.action_id.clone(),
@@ -1240,6 +1259,7 @@ enum Message {
     DisplayTextChanged(String),
     SaveProfile,
     ProfileSaved(Result<(), String>),
+    DisplaysApplied(Result<(), String>),
     RefreshPlugins,
     PluginsLoaded(Result<Vec<InstalledPlugin>, String>),
     InstallPluginPathChanged(String),
@@ -2619,38 +2639,50 @@ impl App {
     }
 
     fn set_selected_action_mode(&mut self, mode: ActionModeChoice) {
-        let Some(slot) = self.selected_binding_mut() else {
-            return;
-        };
-
         match mode {
-            ActionModeChoice::None => *slot = None,
+            ActionModeChoice::None => {
+                if let Some(slot) = self.selected_binding_mut() {
+                    *slot = None;
+                }
+            }
             ActionModeChoice::Plugin => {
                 // Keep existing plugin binding if present; otherwise choose first available action.
-                if matches!(slot, Some(ActionBinding::Plugin(_))) {
+                if matches!(
+                    self.selected_binding().and_then(|b| b.as_ref()),
+                    Some(ActionBinding::Plugin(_))
+                ) {
                     return;
                 }
                 let Some(first) = self.actions.first().cloned() else {
-                    *slot = None;
                     self.error = Some("No plugin actions available. Install a plugin first.".to_string());
+                    if let Some(slot) = self.selected_binding_mut() {
+                        *slot = None;
+                    }
                     return;
                 };
                 let settings = default_settings_for_action(&self.plugins, &first);
-                *slot = Some(ActionBinding::Plugin(PluginActionBinding {
-                    plugin_id: first.plugin_id,
-                    action_id: first.action_id,
-                    settings,
-                }));
+                if let Some(slot) = self.selected_binding_mut() {
+                    *slot = Some(ActionBinding::Plugin(PluginActionBinding {
+                        plugin_id: first.plugin_id,
+                        action_id: first.action_id,
+                        settings,
+                    }));
+                }
             }
             ActionModeChoice::Builtin => {
-                if matches!(slot, Some(ActionBinding::Builtin(_))) {
+                if matches!(
+                    self.selected_binding().and_then(|b| b.as_ref()),
+                    Some(ActionBinding::Builtin(_))
+                ) {
                     return;
                 }
-                *slot = Some(ActionBinding::Builtin(BuiltinAction::IssueCommand {
-                    command: String::new(),
-                    cwd: None,
-                    timeout_ms: None,
-                }));
+                if let Some(slot) = self.selected_binding_mut() {
+                    *slot = Some(ActionBinding::Builtin(BuiltinAction::IssueCommand {
+                        command: String::new(),
+                        cwd: None,
+                        timeout_ms: None,
+                    }));
+                }
             }
         }
     }
@@ -3745,36 +3777,6 @@ fn default_settings_for_action(
     serde_json::Value::Object(map)
 }
 
-fn set_current_key_setting(
-    profile: Option<&mut Profile>,
-    idx: Option<usize>,
-    key: String,
-    value: serde_json::Value,
-) {
-    let (Some(profile), Some(idx)) = (profile, idx) else {
-        return;
-    };
-    let Some(k) = profile.keys.get_mut(idx) else {
-        return;
-    };
-    let Some(binding) = &mut k.action else {
-        return;
-    };
-
-    let ActionBinding::Plugin(binding) = binding else {
-        return;
-    };
-
-    let obj = binding.settings.as_object_mut();
-    if let Some(obj) = obj {
-        obj.insert(key, value);
-    } else {
-        let mut map = serde_json::Map::new();
-        map.insert(key, value);
-        binding.settings = serde_json::Value::Object(map);
-    }
-}
-
 async fn connect_device_async(
     id: app_core::ids::DeviceId,
     events_slot: Arc<std::sync::Mutex<Option<Receiver<DeviceEvent>>>>,
@@ -3797,6 +3799,96 @@ async fn connect_device_async(
         controller,
         events_slot,
     })
+}
+
+async fn apply_displays_async(controller: DeviceController, profile: Profile) -> Result<(), String> {
+    use std::path::PathBuf;
+
+    let (key_w, key_h) = match profile.key_count {
+        6 => (80, 80),
+        32 => (96, 96),
+        8 => (120, 120), // Stream Deck+ (best-effort default)
+        _ => (72, 72),
+    };
+
+    // Keys
+    for (idx, k) in profile.keys.iter().enumerate() {
+        let bg = match k.appearance.background {
+            storage::profiles::Background::Solid { rgb } => Some(rgb),
+            storage::profiles::Background::None => None,
+        };
+        let icon_path = k
+            .appearance
+            .icon_path
+            .as_ref()
+            .map(|s| PathBuf::from(s));
+        let icon_ref = icon_path.as_deref();
+        let text = k.appearance.text.as_deref();
+
+        let jpeg = render::lcd::render_lcd_jpeg(
+            key_w,
+            key_h,
+            bg,
+            icon_ref,
+            text,
+        )
+        .map_err(|e| e.to_string())?;
+
+        controller
+            .set_key_image_jpeg(idx as u8, jpeg)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Stream Deck+ extras (best-effort sizes; device protocol may differ by firmware).
+    if profile.key_count == 8 {
+        // Dials
+        for (idx, d) in profile.dials.iter().enumerate().take(4) {
+            let bg = match d.appearance.background {
+                storage::profiles::Background::Solid { rgb } => Some(rgb),
+                storage::profiles::Background::None => None,
+            };
+            let icon_path = d
+                .appearance
+                .icon_path
+                .as_ref()
+                .map(|s| PathBuf::from(s));
+            let icon_ref = icon_path.as_deref();
+            let text = d.appearance.text.as_deref();
+
+            let jpeg = render::lcd::render_lcd_jpeg(100, 100, bg, icon_ref, text)
+                .map_err(|e| e.to_string())?;
+
+            controller
+                .set_dial_image_jpeg(idx as u8, jpeg)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Touch strip
+        let bg = match profile.touch_strip.appearance.background {
+            storage::profiles::Background::Solid { rgb } => Some(rgb),
+            storage::profiles::Background::None => None,
+        };
+        let icon_path = profile
+            .touch_strip
+            .appearance
+            .icon_path
+            .as_ref()
+            .map(|s| PathBuf::from(s));
+        let icon_ref = icon_path.as_deref();
+        let text = profile.touch_strip.appearance.text.as_deref();
+
+        let jpeg = render::lcd::render_lcd_jpeg(800, 100, bg, icon_ref, text)
+            .map_err(|e| e.to_string())?;
+
+        controller
+            .set_touch_strip_image_jpeg(jpeg)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 async fn set_brightness_async(controller: DeviceController, percent: u8) -> Result<(), String> {

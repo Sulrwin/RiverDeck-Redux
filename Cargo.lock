@@ -4187,6 +4187,7 @@ dependencies = [
  "iced",
  "openaction",
  "plugin-runtime",
+ "render",
  "rodio",
  "serde_json",
  "storage",

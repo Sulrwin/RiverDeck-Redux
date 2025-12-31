@@ -12,6 +12,7 @@ device = { path = "../device" }
 iced.workspace = true
 openaction = { path = "../openaction" }
 plugin-runtime = { path = "../plugin-runtime" }
+render = { path = "../render" }
 rodio.workspace = true
 serde_json.workspace = true
 storage = { path = "../storage" }
