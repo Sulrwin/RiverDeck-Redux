@@ -70,11 +70,26 @@ enum ActiveView {
 
 #[derive(Debug, Clone)]
 struct MarketplaceState {
-    index_url: String,
+    sources: Vec<MarketplaceSource>,
+    selected_source_idx: Option<usize>,
     loading: bool,
     plugins: Vec<MarketplacePlugin>,
     query: String,
     error: Option<String>,
+    new_source_name: String,
+    new_source_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MarketplaceSource {
+    name: String,
+    index_url: String,
+}
+
+impl fmt::Display for MarketplaceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
 }
 
 impl Application for App {
@@ -84,8 +99,8 @@ impl Application for App {
     type Flags = ();
 
     fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
-        let index_url = std::env::var("OPENACTION_MARKETPLACE_INDEX_URL")
-            .unwrap_or_else(|_| "https://openaction.marketplace/plugins.json".to_string());
+        let sources = default_marketplace_sources();
+        let selected_source_idx = if sources.is_empty() { None } else { Some(0) };
 
         let app = Self {
             core: AppCore::new(),
@@ -106,11 +121,14 @@ impl Application for App {
             install_plugin_path: String::new(),
             active_view: ActiveView::Main,
             marketplace: MarketplaceState {
-                index_url,
+                sources,
+                selected_source_idx,
                 loading: false,
                 plugins: vec![],
                 query: String::new(),
                 error: None,
+                new_source_name: String::new(),
+                new_source_url: String::new(),
             },
             error: None,
         };
@@ -388,27 +406,65 @@ impl Application for App {
             },
             Message::OpenMarketplace => {
                 self.active_view = ActiveView::Marketplace;
+                let Some(idx) = self.marketplace.selected_source_idx else {
+                    self.marketplace.loading = false;
+                    self.marketplace.error = Some("No marketplace selected.".to_string());
+                    return Command::none();
+                };
+                let url = self.marketplace.sources.get(idx).map(|s| s.index_url.clone());
+                let Some(url) = url else {
+                    self.marketplace.loading = false;
+                    self.marketplace.error = Some("Invalid marketplace selection.".to_string());
+                    return Command::none();
+                };
+                if url.trim().is_empty() {
+                    self.marketplace.loading = false;
+                    self.marketplace.error =
+                        Some("Marketplace URL is empty. Add/edit a marketplace first.".to_string());
+                    return Command::none();
+                }
                 self.marketplace.loading = true;
                 self.marketplace.error = None;
-                Command::perform(
-                    fetch_marketplace_async(self.marketplace.index_url.clone()),
-                    Message::MarketplaceLoaded,
-                )
+                Command::perform(fetch_marketplace_async(url), Message::MarketplaceLoaded)
             }
             Message::CloseMarketplace => {
                 self.active_view = ActiveView::Main;
                 Command::none()
             }
             Message::MarketplaceRefresh => {
+                let Some(idx) = self.marketplace.selected_source_idx else {
+                    self.marketplace.loading = false;
+                    self.marketplace.error = Some("No marketplace selected.".to_string());
+                    return Command::none();
+                };
+                let url = self.marketplace.sources.get(idx).map(|s| s.index_url.clone());
+                let Some(url) = url else {
+                    self.marketplace.loading = false;
+                    self.marketplace.error = Some("Invalid marketplace selection.".to_string());
+                    return Command::none();
+                };
+                if url.trim().is_empty() {
+                    self.marketplace.loading = false;
+                    self.marketplace.error =
+                        Some("Marketplace URL is empty. Add/edit a marketplace first.".to_string());
+                    return Command::none();
+                }
                 self.marketplace.loading = true;
                 self.marketplace.error = None;
-                Command::perform(
-                    fetch_marketplace_async(self.marketplace.index_url.clone()),
-                    Message::MarketplaceLoaded,
-                )
+                Command::perform(fetch_marketplace_async(url), Message::MarketplaceLoaded)
+            }
+            Message::MarketplaceSourcePicked(src) => {
+                let idx = self.marketplace.sources.iter().position(|s| s == &src);
+                self.marketplace.selected_source_idx = idx;
+                Command::perform(async { () }, |_| Message::MarketplaceRefresh)
             }
             Message::MarketplaceIndexUrlChanged(url) => {
-                self.marketplace.index_url = url;
+                // Allow editing the current source URL in-place.
+                if let Some(idx) = self.marketplace.selected_source_idx {
+                    if let Some(sel) = self.marketplace.sources.get_mut(idx) {
+                        sel.index_url = url;
+                    }
+                }
                 Command::none()
             }
             Message::MarketplaceSearchChanged(q) => {
@@ -428,6 +484,39 @@ impl Application for App {
                     }
                 }
                 Command::none()
+            }
+            Message::MarketplaceNewSourceNameChanged(v) => {
+                self.marketplace.new_source_name = v;
+                Command::none()
+            }
+            Message::MarketplaceNewSourceUrlChanged(v) => {
+                self.marketplace.new_source_url = v;
+                Command::none()
+            }
+            Message::MarketplaceAddSource => {
+                let name = self.marketplace.new_source_name.trim().to_string();
+                let url = self.marketplace.new_source_url.trim().to_string();
+                if name.is_empty() || url.is_empty() {
+                    return Command::none();
+                }
+
+                let src = MarketplaceSource {
+                    name,
+                    index_url: url,
+                };
+
+                if !self.marketplace.sources.contains(&src) {
+                    self.marketplace.sources.push(src.clone());
+                }
+                self.marketplace.selected_source_idx = self
+                    .marketplace
+                    .sources
+                    .iter()
+                    .position(|s| s == &src);
+                self.marketplace.new_source_name.clear();
+                self.marketplace.new_source_url.clear();
+
+                Command::perform(async { () }, |_| Message::MarketplaceRefresh)
             }
             Message::ActionSelected(choice) => {
                 let Some(idx) = self.selected_key else {
@@ -627,9 +716,13 @@ enum Message {
     OpenMarketplace,
     CloseMarketplace,
     MarketplaceRefresh,
+    MarketplaceSourcePicked(MarketplaceSource),
     MarketplaceIndexUrlChanged(String),
     MarketplaceSearchChanged(String),
     MarketplaceLoaded(Result<Vec<MarketplacePlugin>, String>),
+    MarketplaceNewSourceNameChanged(String),
+    MarketplaceNewSourceUrlChanged(String),
+    MarketplaceAddSource,
     ActionSelected(ActionChoice),
     ActionSearchChanged(String),
     SettingStringChanged { key: String, value: String },
@@ -896,13 +989,45 @@ impl App {
         .align_items(Alignment::Center)
         .spacing(10);
 
+        let selected = self
+            .marketplace
+            .selected_source_idx
+            .and_then(|i| self.marketplace.sources.get(i))
+            .cloned();
+
+        let source_picker = pick_list(
+            self.marketplace.sources.clone(),
+            selected.clone(),
+            Message::MarketplaceSourcePicked,
+        );
+
+        let current_url = selected
+            .as_ref()
+            .map(|s| s.index_url.as_str())
+            .unwrap_or("");
+
         let url_row = row![
+            text("Marketplace").size(12).style(color_text_muted()),
+            source_picker,
+            horizontal_space(),
             text("Index URL").size(12).style(color_text_muted()),
-            text_input("https://…/plugins.json", &self.marketplace.index_url)
+            text_input("https://…/plugins.json", current_url)
                 .on_input(Message::MarketplaceIndexUrlChanged),
             button(text("Refresh"))
                 .style(iced::theme::Button::Secondary)
                 .on_press(Message::MarketplaceRefresh),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+
+        let add_row = row![
+            text_input("New marketplace name", &self.marketplace.new_source_name)
+                .on_input(Message::MarketplaceNewSourceNameChanged),
+            text_input("New marketplace index URL", &self.marketplace.new_source_url)
+                .on_input(Message::MarketplaceNewSourceUrlChanged),
+            button(text("Add"))
+                .style(iced::theme::Button::Secondary)
+                .on_press(Message::MarketplaceAddSource),
         ]
         .spacing(10)
         .align_items(Alignment::Center);
@@ -959,6 +1084,7 @@ impl App {
             header,
             h_divider(),
             url_row,
+            add_row,
             search,
             status,
             scrollable(list).height(Length::Fill)
@@ -1496,6 +1622,47 @@ fn h_divider() -> Element<'static, Message> {
         .height(Length::Fixed(1.0))
         .style(divider_style())
         .into()
+}
+
+fn default_marketplace_sources() -> Vec<MarketplaceSource> {
+    // Built-in default: Rivul/OpenAction marketplace catalogue
+    // (as used by https://marketplace.rivul.us/).
+    let mut out = vec![MarketplaceSource {
+        name: "Rivul (OpenAction)".to_string(),
+        index_url: "https://openactionapi.github.io/plugins/catalogue.json".to_string(),
+    }];
+
+    // Optional user-provided list:
+    // OPENACTION_MARKETPLACES="Name|https://...;Other|https://..."
+    if let Ok(raw) = std::env::var("OPENACTION_MARKETPLACES") {
+        for part in raw.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let mut it = part.splitn(2, '|');
+            let name = it.next().unwrap_or("").trim();
+            let url = it.next().unwrap_or("").trim();
+            if name.is_empty() || url.is_empty() {
+                continue;
+            }
+            let src = MarketplaceSource {
+                name: name.to_string(),
+                index_url: url.to_string(),
+            };
+            if !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
+
+    // Placeholder "your own" marketplace, editable in UI.
+    out.push(MarketplaceSource {
+        name: "My Marketplace".to_string(),
+        index_url: String::new(),
+    });
+
+    out
 }
 
 fn deck_grid_dims(key_count: u8) -> (usize, usize) {
