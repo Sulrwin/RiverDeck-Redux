@@ -124,6 +124,7 @@ struct MarketplaceState {
     icon_cache: HashMap<String, iced::widget::image::Handle>,
     image_cache: HashMap<String, iced::widget::image::Handle>,
     svg_cache: HashMap<String, iced::widget::svg::Handle>,
+    image_error_cache: HashMap<String, String>,
     details_cache: HashMap<String, MarketplaceDetails>,
     page: usize,
     installing: Option<String>,
@@ -237,6 +238,7 @@ impl Application for App {
                 icon_cache: HashMap::new(),
                 image_cache: HashMap::new(),
                 svg_cache: HashMap::new(),
+                image_error_cache: HashMap::new(),
                 details_cache: HashMap::new(),
                 page: 0,
                 installing: None,
@@ -905,23 +907,13 @@ impl Application for App {
                     {
                         continue;
                     }
-                    if url.to_ascii_lowercase().contains(".svg") {
-                        cmds.push(Command::perform(
-                            fetch_icon_async(url),
-                            {
-                                let key = key.clone();
-                                move |bytes| Message::MarketplaceSvgLoaded { key, bytes }
-                            },
-                        ));
-                    } else {
-                        cmds.push(Command::perform(
-                            fetch_icon_async(url),
-                            {
-                                let key = key.clone();
-                                move |bytes| Message::MarketplaceImageLoaded { key, bytes }
-                            },
-                        ));
-                    }
+                    cmds.push(Command::perform(
+                        fetch_icon_async(url),
+                        {
+                            let key = key.clone();
+                            move |bytes| Message::MarketplaceImageLoaded { key, bytes }
+                        },
+                    ));
                 }
 
                 // Fetch richer details (README, derived downloads, README images).
@@ -942,18 +934,48 @@ impl Application for App {
             }
             }
             Message::MarketplaceImageLoaded { key, bytes } => {
-                if let Ok(bytes) = bytes {
-                    self.marketplace
-                        .image_cache
-                        .insert(key, iced::widget::image::Handle::from_memory(bytes));
-                }
-                Command::none()
-            }
-            Message::MarketplaceSvgLoaded { key, bytes } => {
-                if let Ok(bytes) = bytes {
-                    self.marketplace
-                        .svg_cache
-                        .insert(key, iced::widget::svg::Handle::from_memory(bytes));
+                match bytes {
+                    Ok(bytes) => {
+                        self.marketplace.image_error_cache.remove(&key);
+
+                        if is_svg_bytes(&bytes) {
+                            if let Err(e) = validate_svg_bytes(&bytes) {
+                                self.marketplace.image_error_cache.insert(key, format!("bad svg: {e}"));
+                                return Command::none();
+                            }
+                            self.marketplace
+                                .svg_cache
+                                .insert(key, iced::widget::svg::Handle::from_memory(bytes));
+                        } else if is_png_bytes(&bytes) || is_jpeg_bytes(&bytes) {
+                            self.marketplace
+                                .image_cache
+                                .insert(key, iced::widget::image::Handle::from_memory(bytes));
+                        } else if is_gif_bytes(&bytes) || is_webp_bytes(&bytes) {
+                            // Iced's image handle decoding may not support animated GIF/WEBP directly
+                            // (or may fail on some files). Decode via `image` and re-encode to PNG.
+                            match decode_raster_to_png_bytes(&bytes) {
+                                Ok(png) => {
+                                    self.marketplace.image_cache.insert(
+                                        key,
+                                        iced::widget::image::Handle::from_memory(png),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.marketplace
+                                        .image_error_cache
+                                        .insert(key, format!("gif/webp decode failed: {e}"));
+                                }
+                            }
+                        } else {
+                            self.marketplace.image_error_cache.insert(
+                                key,
+                                "unsupported image format (expected svg/png/jpeg/gif/webp)".to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.marketplace.image_error_cache.insert(key, e);
+                    }
                 }
                 Command::none()
             }
@@ -1013,23 +1035,13 @@ impl Application for App {
                             {
                                 continue;
                             }
-                            if url.to_ascii_lowercase().contains(".svg") {
-                                cmds.push(Command::perform(
-                                    fetch_icon_async(url),
-                                    {
-                                        let key = key.clone();
-                                        move |bytes| Message::MarketplaceSvgLoaded { key, bytes }
-                                    },
-                                ));
-                            } else {
-                                cmds.push(Command::perform(
-                                    fetch_icon_async(url),
-                                    {
-                                        let key = key.clone();
-                                        move |bytes| Message::MarketplaceImageLoaded { key, bytes }
-                                    },
-                                ));
-                            }
+                            cmds.push(Command::perform(
+                                fetch_icon_async(url),
+                                {
+                                    let key = key.clone();
+                                    move |bytes| Message::MarketplaceImageLoaded { key, bytes }
+                                },
+                            ));
                         }
                         if cmds.is_empty() {
                             Command::none()
@@ -1487,7 +1499,6 @@ enum Message {
     MarketplaceNextPage,
     MarketplaceSelect(MarketplacePlugin),
     MarketplaceImageLoaded { key: String, bytes: Result<Vec<u8>, String> },
-    MarketplaceSvgLoaded { key: String, bytes: Result<Vec<u8>, String> },
     MarketplaceDetailsLoaded {
         plugin_id: String,
         details: Result<MarketplaceDetails, String>,
@@ -2551,6 +2562,24 @@ impl App {
                             .width(Length::Fill)
                             .height(Length::Shrink)
                         ,
+                    );
+                } else if let Some(err) = self.marketplace.image_error_cache.get(&key) {
+                    shots = shots.push(
+                        row![
+                            text("Failed to load image.")
+                                .style(iced::theme::Text::Color(color_text_muted())),
+                            horizontal_space(),
+                            button(text("Open"))
+                                .style(iced::theme::Button::Secondary)
+                                .on_press(Message::OpenUrl(url.clone())),
+                        ]
+                        .align_items(Alignment::Center)
+                        .spacing(10),
+                    );
+                    shots = shots.push(
+                        text(err.clone())
+                            .size(12)
+                            .style(iced::theme::Text::Color(color_text_muted())),
                     );
                 } else {
                     shots = shots.push(
@@ -4604,15 +4633,59 @@ fn is_renderable_image_url(url: &str) -> bool {
     if u.is_empty() {
         return false;
     }
-    // SVG is now supported via iced's `svg` widget; raster formats supported via `image` features.
-    u.ends_with(".svg")
-        || u.contains(".svg?")
-        || u.ends_with(".png")
-        || u.contains(".png?")
-        || u.ends_with(".jpg")
-        || u.contains(".jpg?")
-        || u.ends_with(".jpeg")
-        || u.contains(".jpeg?")
+    // Accept image-like URLs, even if they lack an extension (e.g. shields.io badges).
+    // We'll sniff bytes after download to decide svg vs png vs jpeg.
+    u.contains("://")
+}
+
+fn is_png_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 8
+        && bytes[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+}
+
+fn is_jpeg_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+}
+
+fn is_gif_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a")
+}
+
+fn is_webp_bytes(bytes: &[u8]) -> bool {
+    // RIFF....WEBP
+    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+}
+
+fn decode_raster_to_png_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use ::image::codecs::png::PngEncoder;
+    use ::image::{ColorType, ImageEncoder};
+
+    let img =
+        ::image::load_from_memory(bytes).map_err(|e| format!("image decode failed: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+
+    let mut out = Vec::new();
+    let enc = PngEncoder::new(&mut out);
+    enc.write_image(&rgba, w, h, ColorType::Rgba8.into())
+        .map_err(|e| format!("png encode failed: {e}"))?;
+    Ok(out)
+}
+
+fn is_svg_bytes(bytes: &[u8]) -> bool {
+    // Best-effort sniff: look for "<svg" within the first ~1KB (after optional XML decl/whitespace).
+    let head = &bytes[..bytes.len().min(1024)];
+    let s = String::from_utf8_lossy(head).to_ascii_lowercase();
+    s.contains("<svg") && !s.contains("<html")
+}
+
+fn validate_svg_bytes(bytes: &[u8]) -> Result<(), String> {
+    // Avoid noisy runtime errors: if parsing fails, treat as a failed image load.
+    use usvg::TreeParsing;
+    let opt = usvg::Options::default();
+    usvg::Tree::from_data(bytes, &opt)
+        .map(|_| ())
+        .map_err(|e: usvg::Error| e.to_string())
 }
 
 fn resolve_github_readme_asset_url(owner: &str, repo: &str, branch: &str, raw: &str) -> Option<String> {
