@@ -17,6 +17,7 @@ use app_core::ids::ProfileId;
 use storage::profiles::{ActionBinding, Profile, ProfileMeta};
 
 use openaction::manifest::{ActionDefinition, SettingField, SettingType};
+use openaction::marketplace::MarketplacePlugin;
 use openaction::registry::InstalledPlugin;
 use plugin_runtime::ActionRuntime;
 
@@ -56,6 +57,23 @@ struct App {
     actions: Vec<ActionChoice>,
     action_search: String,
     install_plugin_path: String,
+    active_view: ActiveView,
+    marketplace: MarketplaceState,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveView {
+    Main,
+    Marketplace,
+}
+
+#[derive(Debug, Clone)]
+struct MarketplaceState {
+    index_url: String,
+    loading: bool,
+    plugins: Vec<MarketplacePlugin>,
+    query: String,
     error: Option<String>,
 }
 
@@ -66,6 +84,9 @@ impl Application for App {
     type Flags = ();
 
     fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+        let index_url = std::env::var("OPENACTION_MARKETPLACE_INDEX_URL")
+            .unwrap_or_else(|_| "https://openaction.marketplace/plugins.json".to_string());
+
         let app = Self {
             core: AppCore::new(),
             devices: vec![],
@@ -83,6 +104,14 @@ impl Application for App {
             actions: vec![],
             action_search: String::new(),
             install_plugin_path: String::new(),
+            active_view: ActiveView::Main,
+            marketplace: MarketplaceState {
+                index_url,
+                loading: false,
+                plugins: vec![],
+                query: String::new(),
+                error: None,
+            },
             error: None,
         };
 
@@ -357,6 +386,49 @@ impl Application for App {
                     Command::none()
                 }
             },
+            Message::OpenMarketplace => {
+                self.active_view = ActiveView::Marketplace;
+                self.marketplace.loading = true;
+                self.marketplace.error = None;
+                Command::perform(
+                    fetch_marketplace_async(self.marketplace.index_url.clone()),
+                    Message::MarketplaceLoaded,
+                )
+            }
+            Message::CloseMarketplace => {
+                self.active_view = ActiveView::Main;
+                Command::none()
+            }
+            Message::MarketplaceRefresh => {
+                self.marketplace.loading = true;
+                self.marketplace.error = None;
+                Command::perform(
+                    fetch_marketplace_async(self.marketplace.index_url.clone()),
+                    Message::MarketplaceLoaded,
+                )
+            }
+            Message::MarketplaceIndexUrlChanged(url) => {
+                self.marketplace.index_url = url;
+                Command::none()
+            }
+            Message::MarketplaceSearchChanged(q) => {
+                self.marketplace.query = q;
+                Command::none()
+            }
+            Message::MarketplaceLoaded(res) => {
+                self.marketplace.loading = false;
+                match res {
+                    Ok(list) => {
+                        self.marketplace.plugins = list;
+                        self.marketplace.error = None;
+                    }
+                    Err(e) => {
+                        self.marketplace.plugins.clear();
+                        self.marketplace.error = Some(e);
+                    }
+                }
+                Command::none()
+            }
             Message::ActionSelected(choice) => {
                 let Some(idx) = self.selected_key else {
                     self.error =
@@ -488,24 +560,30 @@ impl Application for App {
 
     fn view(&self) -> Element<'_, Self::Message> {
         let topbar = self.view_topbar();
-        let sidebar = self.view_sidebar();
-        let preview = self.view_preview_panel();
-        let inspector = self.view_inspector_panel();
-        let actions = self.view_actions_panel();
+        let content: Element<Message> = match self.active_view {
+            ActiveView::Main => {
+                let sidebar = self.view_sidebar();
+                let preview = self.view_preview_panel();
+                let inspector = self.view_inspector_panel();
+                let actions = self.view_actions_panel();
 
-        let main = column![preview, inspector]
-            .spacing(12)
-            .width(Length::Fill)
-            .height(Length::Fill);
+                let main = column![preview, h_divider(), inspector]
+                    .spacing(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill);
 
-        let content = row![sidebar, main, actions]
-            .spacing(16)
-            .width(Length::Fill)
-            .height(Length::Fill);
+                row![sidebar, v_divider(), main, v_divider(), actions]
+                    .spacing(0)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            ActiveView::Marketplace => self.view_marketplace(),
+        };
 
         let mut root = column![topbar, content]
-            .spacing(12)
-            .padding(16)
+            .spacing(10)
+            .padding(12)
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -546,6 +624,12 @@ enum Message {
     InstallPluginPathChanged(String),
     InstallPluginFromPath,
     PluginInstalled(Result<(), String>),
+    OpenMarketplace,
+    CloseMarketplace,
+    MarketplaceRefresh,
+    MarketplaceIndexUrlChanged(String),
+    MarketplaceSearchChanged(String),
+    MarketplaceLoaded(Result<Vec<MarketplacePlugin>, String>),
     ActionSelected(ActionChoice),
     ActionSearchChanged(String),
     SettingStringChanged { key: String, value: String },
@@ -729,6 +813,9 @@ impl App {
                 button(text("Refresh"))
                     .style(iced::theme::Button::Secondary)
                     .on_press(Message::RefreshPlugins),
+                button(text("Marketplace"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::OpenMarketplace),
             ]
             .spacing(8),
         );
@@ -793,6 +880,95 @@ impl App {
         container(content)
             .padding(12)
             .width(Length::Fixed(360.0))
+            .height(Length::Fill)
+            .style(panel())
+            .into()
+    }
+
+    fn view_marketplace(&self) -> Element<'_, Message> {
+        let header = row![
+            text("Plugin Marketplace").size(18),
+            horizontal_space(),
+            button(text("Back"))
+                .style(iced::theme::Button::Secondary)
+                .on_press(Message::CloseMarketplace),
+        ]
+        .align_items(Alignment::Center)
+        .spacing(10);
+
+        let url_row = row![
+            text("Index URL").size(12).style(color_text_muted()),
+            text_input("https://…/plugins.json", &self.marketplace.index_url)
+                .on_input(Message::MarketplaceIndexUrlChanged),
+            button(text("Refresh"))
+                .style(iced::theme::Button::Secondary)
+                .on_press(Message::MarketplaceRefresh),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+
+        let search = text_input("Search plugins…", &self.marketplace.query)
+            .on_input(Message::MarketplaceSearchChanged);
+
+        let q = self.marketplace.query.trim().to_ascii_lowercase();
+        let list_iter = self.marketplace.plugins.iter().filter(|p| {
+            if q.is_empty() {
+                true
+            } else {
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.id.to_ascii_lowercase().contains(&q)
+                    || p.description.to_ascii_lowercase().contains(&q)
+            }
+        });
+
+        let mut list = column![].spacing(10);
+        for p in list_iter {
+            let mut body = column![text(&p.name).size(14)]
+                .spacing(4)
+                .push(text(p.id.clone()).size(12).style(color_text_muted()));
+
+            if !p.version.is_empty() {
+                body = body.push(text(format!("v{}", p.version)).size(12).style(color_text_muted()));
+            }
+            if !p.description.is_empty() {
+                body = body.push(text(p.description.clone()).size(12).style(color_text_muted()));
+            }
+
+            let install_btn = if p.download_url.is_some() {
+                button(text("Install")).style(iced::theme::Button::Secondary)
+            } else {
+                button(text("Install")).style(iced::theme::Button::Secondary)
+            };
+
+            list = list.push(container(row![container(body).width(Length::Fill), install_btn].spacing(12))
+                .padding(10)
+                .style(panel()));
+        }
+
+        let status: Element<Message> = if self.marketplace.loading {
+            text("Loading…").style(color_text_muted()).into()
+        } else if let Some(err) = &self.marketplace.error {
+            text(format!("Error: {err}")).into()
+        } else if self.marketplace.plugins.is_empty() {
+            text("No plugins found.").style(color_text_muted()).into()
+        } else {
+            text("").into()
+        };
+
+        let content = column![
+            header,
+            h_divider(),
+            url_row,
+            search,
+            status,
+            scrollable(list).height(Length::Fill)
+        ]
+        .spacing(10)
+        .height(Length::Fill);
+
+        container(content)
+            .padding(12)
+            .width(Length::Fill)
             .height(Length::Fill)
             .style(panel())
             .into()
@@ -1261,19 +1437,17 @@ fn app_background() -> iced::theme::Container {
 fn panel() -> iced::theme::Container {
     iced::theme::Container::Custom(Box::new(|theme: &Theme| {
         let p = theme.extended_palette();
+        let mut shade = p.background.weak.color;
+        shade.a = 0.92;
         iced::widget::container::Appearance {
-            background: Some(Background::Color(p.background.weak.color)),
+            background: Some(Background::Color(shade)),
             text_color: Some(p.background.base.text),
-            border: Border {
-                radius: 10.0.into(),
-                width: 1.0,
-                color: p.background.strong.color,
-            },
+            border: Border::default(),
             shadow: Shadow {
-                // Softer, "flowing" elevation (less harsh toy-like drop shadow).
-                color: Color::from_rgba8(0, 0, 0, 0.22),
-                offset: iced::Vector::new(0.0, 10.0),
-                blur_radius: 28.0,
+                // Subtle shading (keep it sleek; dividers do most of the separation).
+                color: Color::from_rgba8(0, 0, 0, 0.12),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 12.0,
             },
         }
     }))
@@ -1285,13 +1459,43 @@ fn error_banner() -> iced::theme::Container {
             background: Some(Background::Color(Color::from_rgb8(70, 10, 10))),
             text_color: Some(Color::from_rgb8(255, 190, 190)),
             border: Border {
-                radius: 10.0.into(),
+                radius: 0.0.into(),
                 width: 1.0,
                 color: Color::from_rgb8(120, 30, 30),
             },
             shadow: Shadow::default(),
         }
     }))
+}
+
+fn divider_style() -> iced::theme::Container {
+    iced::theme::Container::Custom(Box::new(|theme: &Theme| {
+        let p = theme.extended_palette();
+        let mut c = p.background.strong.color;
+        c.a = 0.65;
+        iced::widget::container::Appearance {
+            background: Some(Background::Color(c)),
+            text_color: None,
+            border: Border::default(),
+            shadow: Shadow::default(),
+        }
+    }))
+}
+
+fn v_divider() -> Element<'static, Message> {
+    container(text(""))
+        .width(Length::Fixed(1.0))
+        .height(Length::Fill)
+        .style(divider_style())
+        .into()
+}
+
+fn h_divider() -> Element<'static, Message> {
+    container(text(""))
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(divider_style())
+        .into()
 }
 
 fn deck_grid_dims(key_count: u8) -> (usize, usize) {
@@ -1390,6 +1594,12 @@ async fn list_plugins_async() -> Result<Vec<InstalledPlugin>, String> {
 async fn install_plugin_async(path: String) -> Result<(), String> {
     use std::path::Path;
     openaction::registry::install_local_dir(Path::new(&path)).map_err(|e| e.to_string())
+}
+
+async fn fetch_marketplace_async(url: String) -> Result<Vec<MarketplacePlugin>, String> {
+    openaction::marketplace::fetch_plugins(&url)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn invoke_action_async(
