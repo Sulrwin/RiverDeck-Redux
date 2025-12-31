@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/app-core",
+  "crates/ui-iced",
+  "crates/device",
+  "crates/transport-hid",
+  "crates/render",
+  "crates/openaction",
+  "crates/plugin-runtime",
+  "crates/storage",
+  "crates/cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://example.invalid/riverdeck-redux"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+directories = "5.0"
+futures = "0.3"
+hidapi = "2.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+iced = { version = "0.12", features = ["tokio", "image"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+
