@@ -126,7 +126,7 @@ fn draw_char(img: &mut RgbaImage, x0: u32, y0: u32, ch: char, scale: u32, color:
             if (bits >> col) & 1 == 0 {
                 continue;
             }
-            let px = x0 + (7 - col) as u32 * scale;
+            let px = x0 + col as u32 * scale;
             let py = y0 + row as u32 * scale;
             fill_rect(img, px, py, scale, scale, color);
         }

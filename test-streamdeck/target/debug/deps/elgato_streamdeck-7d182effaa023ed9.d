@@ -1,0 +1,10 @@
+/home/sulrwin/Repos/RiverDeck-Redux/test-streamdeck/target/debug/deps/elgato_streamdeck-7d182effaa023ed9.d: /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/lib.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/info.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/util.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/images.rs
+
+/home/sulrwin/Repos/RiverDeck-Redux/test-streamdeck/target/debug/deps/libelgato_streamdeck-7d182effaa023ed9.rlib: /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/lib.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/info.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/util.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/images.rs
+
+/home/sulrwin/Repos/RiverDeck-Redux/test-streamdeck/target/debug/deps/libelgato_streamdeck-7d182effaa023ed9.rmeta: /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/lib.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/info.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/util.rs /home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/images.rs
+
+/home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/lib.rs:
+/home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/info.rs:
+/home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/util.rs:
+/home/sulrwin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/elgato-streamdeck-0.12.1/src/images.rs:

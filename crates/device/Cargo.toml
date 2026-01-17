@@ -9,8 +9,10 @@ rust-version.workspace = true
 app-core = { path = "../app-core" }
 anyhow.workspace = true
 async-trait.workspace = true
+elgato-streamdeck.workspace = true
+hidapi.workspace = true
+image.workspace = true
+render = { path = "../render" }
 tokio.workspace = true
 tracing.workspace = true
-transport-hid = { path = "../transport-hid" }
-
 

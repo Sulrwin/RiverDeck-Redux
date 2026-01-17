@@ -1,0 +1,12 @@
+
+[package]
+name = "test-streamdeck"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+elgato-streamdeck = "0.12.1"
+image = "0.25"
+anyhow = "1.0"

@@ -25,6 +25,7 @@ async-trait = "0.1"
 bytes = "1.7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "5.0"
+elgato-streamdeck = { version = "0.12.1", features = ["async"] }
 font8x8 = "0.3"
 futures = "0.3"
 hidapi = "2.6"
@@ -44,5 +45,3 @@ tar = "0.4"
 tempfile = "3.12"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 usvg = "0.36"
-
-

@@ -86,6 +86,7 @@ async fn cmd_test_image(args: &[String]) -> anyhow::Result<()> {
     let (w, h) = match dev.key_count {
         6 => (80, 80),  // common mini size
         32 => (96, 96), // common XL size
+        8 => (120, 120), // Stream Deck+ keys (best-effort default)
         _ => (72, 72),  // common original/mk2 size
     };
 

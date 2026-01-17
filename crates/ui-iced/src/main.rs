@@ -14,9 +14,10 @@ use iced::widget::{
     button, checkbox, column, container, horizontal_rule, horizontal_space, image, mouse_area,
     pick_list, row, scrollable, slider, text, text_input,
 };
+use iced_aw::{color_picker, Modal};
 use iced::{
-    alignment::Horizontal, Alignment, Application, Background, Border, Color, Command, Element,
-    Length, Settings, Shadow, Theme,
+    alignment::{Horizontal, Vertical}, Alignment, Application, Background, Border, Color, Command, Element,
+    Length, Settings, Shadow, Subscription, Theme,
 };
 use tokio::sync::mpsc::Receiver;
 
@@ -49,6 +50,7 @@ fn init_tracing() {
 
 struct App {
     core: AppCore,
+    show_color_picker: bool,
     devices: Vec<DiscoveredDevice>,
     device_choices: Vec<DeviceChoice>,
     selected_device: Option<app_core::ids::DeviceId>,
@@ -251,6 +253,7 @@ impl Application for App {
             sys_last_refresh: Instant::now(),
             sys_snapshot: SystemSnapshot::default(),
             drag: DragState::default(),
+            show_color_picker: false,
         };
 
         let cmd = Command::batch([
@@ -268,6 +271,14 @@ impl Application for App {
     fn theme(&self) -> Self::Theme {
         // A more modern baseline look (affects all default widget styling).
         Theme::TokyoNightStorm
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        // Drive device event polling + live system snapshot updates.
+        // Without this, `Message::Tick` is never emitted and the UI will not:
+        // - drain `ConnectedUi.events` (so presses/actions never run)
+        // - update `sys_snapshot` (so SystemMonitoring binding hints never change)
+        iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick)
     }
 
     fn update(&mut self, _message: Self::Message) -> Command<Self::Message> {
@@ -347,17 +358,28 @@ impl Application for App {
                         };
 
                         self.core.selected_device = Some(info.id);
+                        let brightness: u8 = 30;
                         let pressed = vec![false; info.key_count as usize];
                         self.connected = Some(ConnectedUi {
                             id: info.id,
                             name: info.name.clone(),
                             key_count: info.key_count,
                             pressed,
-                            brightness: 30,
-                            controller: info.controller,
+                            brightness,
+                            controller: info.controller.clone(),
                             events,
                         });
                         self.error = None;
+
+                        // Best-effort: apply a sane default brightness immediately after connect.
+                        // If the device was previously left at 0%, the screens can look "dead".
+                        let set_brightness_cmd = Command::perform(
+                            set_brightness_async(info.controller, brightness),
+                            Message::BrightnessApplied,
+                        );
+                        let list_profiles_cmd =
+                            Command::perform(list_profiles_async(), Message::ProfilesLoaded);
+                        return Command::batch([set_brightness_cmd, list_profiles_cmd]);
                     }
                     Err(e) => {
                         self.connected = None;
@@ -466,7 +488,9 @@ impl Application for App {
                         self.error = Some(e);
                     }
                 }
-                Command::none()
+                // Ensure the physical device LCDs are pushed once a profile becomes available.
+                // (Previously this only happened on edits/save.)
+                self.apply_displays_if_connected()
             }
             Message::SelectControl(sel) => {
                 self.selected_control = Some(sel);
@@ -547,7 +571,7 @@ impl Application for App {
                         SelectedControl::TouchStrip => {}
                     }
                 }
-                Command::none()
+                self.apply_displays_if_connected()
             }
             Message::BindingTargetPicked(t) => {
                 self.selected_binding_target = t;
@@ -577,7 +601,7 @@ impl Application for App {
                         }
                     }
                 }
-                Command::none()
+                self.apply_displays_if_connected()
             }
             Message::IconPathChanged(v) => {
                 self.edit_icon_path = v;
@@ -600,7 +624,7 @@ impl Application for App {
                         }
                     }
                 }
-                Command::none()
+                self.apply_displays_if_connected()
             }
             Message::DisplayTextChanged(v) => {
                 self.edit_display_text = v;
@@ -623,7 +647,7 @@ impl Application for App {
                         }
                     }
                 }
-                Command::none()
+                self.apply_displays_if_connected()
             }
             Message::SaveProfile => {
                 let Some(p) = self.profile.clone() else {
@@ -1414,10 +1438,83 @@ impl Application for App {
                 }
                 Command::none()
             }
+            Message::OpenColorPicker => {
+                self.show_color_picker = !self.show_color_picker;
+                Command::none()
+            }
+            Message::ColorPicked(c) => {
+                self.show_color_picker = false;
+                let r = (c.r * 255.0) as u8;
+                let g = (c.g * 255.0) as u8;
+                let b = (c.b * 255.0) as u8;
+                let s = format!("{},{},{}", r, g, b);
+                Command::perform(async move { s }, Message::BgRgbChanged)
+            }
+            Message::OpenIconPicker => {
+                Command::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::IconPicked,
+                )
+            }
+            Message::IconPicked(path) => {
+                if let Some(p) = path {
+                    let s = p.to_string_lossy().to_string();
+                    Command::perform(async move { s }, Message::IconPathChanged)
+                } else {
+                    Command::none()
+                }
+            }
         }
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
+        let content = self.view_main_content();
+
+        let overlay: Option<Element<Message>> = if self.show_color_picker {
+            let color = parse_bg_rgb(&self.edit_bg_rgb)
+                .map(|[r, g, b]| Color::from_rgb8(r, g, b))
+                .unwrap_or(Color::WHITE);
+
+            Some(
+                container(
+                    container(
+                        color_picker(
+                            true,
+                            color,
+                            button(text("Cancel")).on_press(Message::OpenColorPicker),
+                            Message::OpenColorPicker,
+                            Message::ColorPicked,
+                        ),
+                    )
+                    .padding(20)
+                    .style(iced::theme::Container::Box),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Left)
+                .align_y(Vertical::Top)
+                .padding(iced::Padding::from([100.0, 0.0, 0.0, 350.0]))
+                .into(),
+            )
+        } else {
+            None
+        };
+
+        Modal::new(content, overlay)
+            .on_esc(Message::OpenColorPicker)
+            .into()
+    }
+
+}
+
+impl App {
+    fn view_main_content(&self) -> Element<'_, Message> {
         let topbar = self.view_topbar();
         let content: Element<Message> = match self.active_view {
             ActiveView::Main => {
@@ -1457,15 +1554,16 @@ impl Application for App {
             .into()
     }
 
-    fn subscription(&self) -> iced::Subscription<Self::Message> {
-        iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick)
-    }
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     RefreshDevices,
     DevicesLoaded(Result<Vec<DiscoveredDevice>, String>),
+    OpenColorPicker,
+    ColorPicked(Color),
+    OpenIconPicker,
+    IconPicked(Option<std::path::PathBuf>),
     DevicePicked(DeviceChoice),
     Connected(Result<ConnectedInfo, String>),
     RefreshProfiles,
@@ -1718,6 +1816,17 @@ impl fmt::Display for MacroStepKindChoice {
 }
 
 impl App {
+    fn apply_displays_if_connected(&self) -> Command<Message> {
+        let Some(c) = self.connected.as_ref() else {
+            return Command::none();
+        };
+        let Some(p) = self.profile.clone() else {
+            return Command::none();
+        };
+        let controller = c.controller.clone();
+        Command::perform(apply_displays_async(controller, p), Message::DisplaysApplied)
+    }
+
     fn current_marketplace_source(&self) -> Option<&MarketplaceSource> {
         self.marketplace
             .selected_source_idx
@@ -2016,7 +2125,7 @@ impl App {
                         profile_selected,
                         Message::ProfilePicked
                     ),
-                    button(text("⟳"))
+                    button(text("R"))
                         .style(iced::theme::Button::Secondary)
                         .on_press(Message::RefreshProfiles),
                     button(text("+"))
@@ -2860,11 +2969,47 @@ impl App {
     }
 
     fn view_display_editor(&self) -> Element<'_, Message> {
+        let color = parse_bg_rgb(&self.edit_bg_rgb)
+            .map(|[r, g, b]| Color::from_rgb8(r, g, b))
+            .unwrap_or(Color::TRANSPARENT);
+
         column![
-            text("Background RGB (r,g,b or empty)").size(12).style(color_text_muted()),
-            text_input("", &self.edit_bg_rgb).on_input(Message::BgRgbChanged),
-            text("Icon path (optional)").size(12).style(color_text_muted()),
-            text_input("/path/to/icon.png", &self.edit_icon_path).on_input(Message::IconPathChanged),
+            text("Background Color").size(12).style(color_text_muted()),
+            row![
+                container(text(""))
+                    .width(Length::Fixed(30.0))
+                    .height(Length::Fixed(30.0))
+                    .style(iced::theme::Container::Custom(Box::new(move |_theme: &Theme| {
+                        iced::widget::container::Appearance {
+                            background: Some(Background::Color(color)),
+                            border: Border {
+                                radius: 4.0.into(),
+                                width: 1.0,
+                                color: Color::from_rgba8(255, 255, 255, 0.2),
+                            },
+                            ..Default::default()
+                        }
+                    }))),
+                button(text("Pick Color"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::OpenColorPicker),
+                button(text("Clear"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::BgRgbChanged(String::new())),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center),
+            text("Icon").size(12).style(color_text_muted()),
+            row![
+                text_input("No icon selected", &self.edit_icon_path)
+                    .on_input(Message::IconPathChanged)
+                    .width(Length::Fill),
+                button(text("Browse…"))
+                    .style(iced::theme::Button::Secondary)
+                    .on_press(Message::OpenIconPicker),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center),
             text("Text (optional)").size(12).style(color_text_muted()),
             text_input("", &self.edit_display_text).on_input(Message::DisplayTextChanged),
         ]
@@ -3098,13 +3243,13 @@ impl App {
             );
 
             let controls = row![
-                button(text("↑"))
+                button(text("^"))
                     .style(iced::theme::Button::Secondary)
                     .on_press(Message::MacroMoveStepUp(i)),
-                button(text("↓"))
+                button(text("v"))
                     .style(iced::theme::Button::Secondary)
                     .on_press(Message::MacroMoveStepDown(i)),
-                button(text("×"))
+                button(text("X"))
                     .style(iced::theme::Button::Secondary)
                     .on_press(Message::MacroRemoveStep(i)),
             ]
@@ -3973,7 +4118,7 @@ impl App {
                             elems.push(
                                 button(text(format!("Open image: {}", truncate(&raw, 60))))
                                     .style(iced::theme::Button::Secondary)
-                                    .on_press(Message::OpenUrl(raw))
+                                    .on_press(Message::OpenUrl(raw.clone()))
                                     .into(),
                             );
                         }
@@ -3981,7 +4126,7 @@ impl App {
                         elems.push(
                             button(text(format!("Open image (unsupported): {}", truncate(&raw, 60))))
                                 .style(iced::theme::Button::Secondary)
-                                .on_press(Message::OpenUrl(raw))
+                                .on_press(Message::OpenUrl(raw.clone()))
                                 .into(),
                         );
                     }

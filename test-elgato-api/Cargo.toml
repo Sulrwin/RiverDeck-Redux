@@ -1,0 +1,10 @@
+
+[package]
+name = "test-elgato-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+elgato-streamdeck = "0.12"
+tokio = { version = "1.0", features = ["full"] }
